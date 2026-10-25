@@ -224,11 +224,31 @@ function hideScan() {
   if (!uploading && !scanning) $('#uploads').hidden = true;
 }
 
-function enqueue(items) {
+// A folder that does not fit is refused as a whole before anything is
+// written: otherwise the card fills up halfway and every later file fails.
+// The server checks each file again, so a failed check here is not fatal.
+async function enqueue(items) {
   // items: [{file, path}] where path is relative to the current folder.
   const dir = state.dir;
+  try {
+    const sp = await post('/api/space', { sizes: [...queue, ...items].map((it) => it.file.size) });
+    if (!sp.fits) return noRoom(items, sp);
+  } catch {
+    if (state.closed) return;
+  }
   for (const it of items) queue.push({ ...it, dir });
   if (!uploading) runQueue();
+}
+
+const TRASH_HINT = 'Файлы, удалённые с карты в Finder или Проводнике, занимают место, пока не очищена Корзина.';
+
+function noRoom(items, sp) {
+  const total = items.reduce((n, it) => n + it.file.size, 0);
+  const files = items.length === 1 ? `«${items[0].path}»` : `Файлов: ${items.length}`;
+  showDialog('Не хватит места на карте',
+    `${files}, ${size(total)}. Вместе с шифрованием${queue.length ? ' и очередью загрузки' : ''} нужно ` +
+    `${size(sp.need)}, а на карте свободно ${size(sp.free)}. Ничего не загружено. ` +
+    `Освободите ещё ${size(sp.need - sp.free)} или выберите меньше файлов. ${TRASH_HINT}`);
 }
 
 function sendOne(item, onProgress) {
@@ -237,7 +257,10 @@ function sendOne(item, onProgress) {
     // batch=1: the server writes the index once, on the flush after the queue.
     xhr.open('POST', `/api/upload?batch=1&dir=${encodeURIComponent(item.dir)}&path=${encodeURIComponent(item.path)}`);
     xhr.upload.onprogress = (ev) => ev.lengthComputable && onProgress(ev.loaded);
-    xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(xhr.responseText.trim() || xhr.statusText)));
+    xhr.onload = () => {
+      if (xhr.status < 300) return resolve();
+      reject(Object.assign(new Error(xhr.responseText.trim() || xhr.statusText), { status: xhr.status }));
+    };
     xhr.onerror = () => reject(new Error('связь с программой потеряна'));
     xhr.send(item.file);
   });
@@ -248,7 +271,7 @@ async function runQueue() {
   $('#uploads-bar').classList.remove('busy');
   const box = $('#uploads');
   box.hidden = false;
-  let done = 0, failed = 0;
+  let done = 0, failed = 0, full = null;
   while (queue.length) {
     const item = queue.shift();
     const total = done + failed + queue.length + 1;
@@ -266,6 +289,13 @@ async function runQueue() {
       done++;
     } catch (e) {
       failed++;
+      if (e.status === 507) {
+        // Every later file would fail the same way.
+        full = { item, left: queue.length + 1, reason: e.message };
+        failed += queue.length;
+        queue.length = 0;
+        break;
+      }
       toast(`${item.path}: ${e.message}`);
       if (state.closed) break;
     }
@@ -279,7 +309,11 @@ async function runQueue() {
   if (scanning) showScan(0);
   else box.hidden = true;
   refresh();
-  if (failed) toast(`Не загружено файлов: ${failed}`);
+  if (full) {
+    showDialog('Место на карте кончилось',
+      `Загружено файлов: ${done}, они сохранены. Не поместилось: ${full.left}, начиная с «${full.item.path}» ` +
+      `(${full.reason}). Освободите место и загрузите оставшиеся заново. ${TRASH_HINT}`);
+  } else if (failed) toast(`Не загружено файлов: ${failed}`);
 }
 
 $('#btn-upload').onclick = () => $('#pick-files').click();
@@ -391,13 +425,17 @@ function showReport(st) {
     title = 'Все файлы целы';
     text = `Проверено файлов: ${st.totalFiles}, ${size(st.totalBytes)}. Каждый прочитан с карты и расшифрован целиком.`;
   }
-  $('#report-title').textContent = title;
-  $('#report-text').textContent = text;
-  $('#report-list').replaceChildren(...st.problems.map((p) => {
+  showDialog(title, text, st.problems.map((p) => {
     const a = el('a', { href: '#' + p.parent, textContent: p.path });
     a.onclick = (ev) => { ev.preventDefault(); closeReport(); go(p.parent); };
     return el('li', {}, a, el('span', { textContent: p.error }));
   }));
+}
+
+function showDialog(title, text, items = []) {
+  $('#report-title').textContent = title;
+  $('#report-text').textContent = text;
+  $('#report-list').replaceChildren(...items);
   $('#report').hidden = false;
   $('#report-close').focus();
 }

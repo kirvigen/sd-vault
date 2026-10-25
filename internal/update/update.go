@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sd-vault/internal/disk"
 )
 
 // Repo is where releases are published.
@@ -204,7 +206,7 @@ const perFileSlack = 256 << 10
 func (u *Updater) checkSpace(dir string, r *Release, targets map[string]string) error {
 	freeSpace := u.FreeSpace
 	if freeSpace == nil {
-		freeSpace = diskFree
+		freeSpace = disk.Free
 	}
 	free, err := freeSpace(dir)
 	if err != nil {
@@ -343,7 +345,7 @@ func (u *Updater) download(ctx context.Context, r *Release, name, want, dst stri
 	}()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAsset+1))
-	if isNoSpace(err) {
+	if disk.IsFull(err) {
 		return errors.New("на карте кончилось место. " + freeHint(0))
 	}
 	if err != nil {
@@ -356,7 +358,7 @@ func (u *Updater) download(ctx context.Context, r *Release, name, want, dst stri
 		return errors.New("скачанный файл не совпал с подписанным — обновление отклонено")
 	}
 	if err = f.Sync(); err != nil {
-		if isNoSpace(err) {
+		if disk.IsFull(err) {
 			return errors.New("на карте кончилось место. " + freeHint(0))
 		}
 		return err

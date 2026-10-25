@@ -324,3 +324,40 @@ func TestContentType(t *testing.T) {
 		}
 	}
 }
+
+func TestUploadRefusedWhenCardFull(t *testing.T) {
+	e := setup(t)
+	e.srv.v.DiskUsage = func(string) (int64, int64, error) { return 4 << 20, 4 << 10, nil }
+
+	space := func(sizes ...int64) (s struct {
+		Need, Free int64
+		Fits       bool
+	}) {
+		t.Helper()
+		body, _ := json.Marshal(map[string][]int64{"sizes": sizes})
+		resp := e.do("POST", "/api/space", bytes.NewReader(body))
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("space: %d", resp.StatusCode)
+		}
+		json.NewDecoder(resp.Body).Decode(&s)
+		return s
+	}
+	if s := space(100 << 10); !s.Fits || s.Free != 4<<20 {
+		t.Errorf("100 KB on a card with 4 MB free: %+v", s)
+	}
+	if s := space(2<<20, 2<<20); s.Fits || s.Need <= 4<<20 {
+		t.Errorf("4 MB on a card with 4 MB free: %+v", s)
+	}
+
+	resp := e.do("POST", "/api/upload?batch=1&path=big.bin", bytes.NewReader(make([]byte, 5<<20)))
+	msg, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInsufficientStorage || !strings.Contains(string(msg), "не хватает места") {
+		t.Fatalf("upload past free space: %d %s", resp.StatusCode, msg)
+	}
+	if n := len(e.list("").Entries); n != 0 {
+		t.Errorf("refused upload listed: %d entries", n)
+	}
+	e.upload("", "small.txt", "fits")
+}

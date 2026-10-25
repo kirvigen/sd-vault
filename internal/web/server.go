@@ -10,6 +10,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log"
 	"mime"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"sd-vault/internal/disk"
 	"sd-vault/internal/vault"
 )
 
@@ -88,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/list", s.auth(http.HandlerFunc(s.handleList)))
 	mux.Handle("GET /api/file/{id}", s.auth(http.HandlerFunc(s.handleFile)))
 	mux.Handle("POST /api/upload", s.auth(http.HandlerFunc(s.handleUpload)))
+	mux.Handle("POST /api/space", s.auth(http.HandlerFunc(s.handleSpace)))
 	mux.Handle("POST /api/flush", s.auth(http.HandlerFunc(s.handleFlush)))
 	mux.Handle("POST /api/verify", s.auth(http.HandlerFunc(s.handleVerifyStart)))
 	mux.Handle("GET /api/verify", s.auth(http.HandlerFunc(s.handleVerifyStatus)))
@@ -223,6 +226,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, vault.ErrBadName)
 		return
 	}
+	// The UI checks a whole selection before queueing it; this catches what
+	// that estimate missed, before the file is written rather than when the
+	// card runs out halfway through it. The body is read anyway: a browser
+	// that is cut off mid-upload reports a lost connection, not this answer.
+	if r.ContentLength >= 0 {
+		if sp, err := s.v.Room([]int64{r.ContentLength}); err == nil && !sp.Fits() {
+			io.Copy(io.Discard, r.Body)
+			writeErr(w, sp.Err())
+			return
+		}
+	}
 	batch := q.Get("batch") != ""
 	mkdirAll, put := s.v.MkdirAll, s.v.Put
 	if batch {
@@ -282,6 +296,28 @@ func (s *Server) flush() error {
 		return nil
 	}
 	return err
+}
+
+// handleSpace tells whether files of the given sizes fit on the card, so
+// the UI can refuse a folder before uploading half of it.
+func (s *Server) handleSpace(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sizes []int64 `json:"sizes"`
+	}
+	// A folder of many thousands of files sends a long list.
+	if err := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 16<<20)).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sp, err := s.v.Room(req.Sizes)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, struct {
+		vault.Space
+		Fits bool `json:"fits"`
+	}{sp, sp.Fits()})
 }
 
 func (s *Server) handleFlush(w http.ResponseWriter, r *http.Request) {
@@ -403,6 +439,12 @@ func writeErr(w http.ResponseWriter, err error) {
 		code = http.StatusBadRequest
 	case errors.Is(err, vault.ErrClosed):
 		code = http.StatusGone
+	case errors.Is(err, vault.ErrNoSpace):
+		code = http.StatusInsufficientStorage
+	case disk.IsFull(err):
+		// The OS text names a temporary file; the user needs the cause.
+		http.Error(w, vault.ErrNoSpace.Error(), http.StatusInsufficientStorage)
+		return
 	default:
 		log.Printf("ошибка: %v", err)
 	}

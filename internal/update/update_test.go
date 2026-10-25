@@ -329,17 +329,3 @@ func TestInstallRefusesWhenTheCardIsFull(t *testing.T) {
 		t.Errorf("program not replaced: %d bytes", len(got))
 	}
 }
-
-func TestDiskFullIsRecognised(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "x")
-	full := &os.PathError{Op: "write", Path: path, Err: noSpaceErrno}
-	if !isNoSpace(full) {
-		t.Error("write error for a full disk not recognised")
-	}
-	if isNoSpace(os.ErrNotExist) {
-		t.Error("unrelated error taken for a full disk")
-	}
-	if free, err := diskFree(t.TempDir()); err != nil || free <= 0 {
-		t.Errorf("diskFree = %d, %v", free, err)
-	}
-}

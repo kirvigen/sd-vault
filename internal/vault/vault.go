@@ -99,6 +99,10 @@ type index struct {
 type Vault struct {
 	dir string
 
+	// DiskUsage reports the bytes free in a directory and its cluster
+	// size; nil means the real disk. Tests replace it.
+	DiskUsage func(dir string) (free, cluster int64, err error)
+
 	mu       sync.RWMutex
 	identity *age.X25519Identity
 	idx      *index

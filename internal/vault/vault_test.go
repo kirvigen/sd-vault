@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"filippo.io/age"
 )
 
 const password = "correct horse battery staple"
@@ -795,5 +797,60 @@ func TestStandardAgeCLI(t *testing.T) {
 	pack := run("-d", "-i", keyPath, filepath.Join(dir, filepath.FromSlash(packed.Pack)))
 	if got := pack[packed.Offset : packed.Offset+packed.Size]; !bytes.Equal(got, small) {
 		t.Fatal("slice of the CLI-decrypted pack differs")
+	}
+}
+
+func TestEncryptedSizeBoundsAge(t *testing.T) {
+	v, _ := newVault(t)
+	for _, n := range []int64{0, 1, ageChunk - 1, ageChunk, ageChunk + 1, 3*ageChunk + 5, packMax} {
+		var buf bytes.Buffer
+		w, err := age.Encrypt(&buf, v.identity.Recipient())
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write(make([]byte, n))
+		w.Close()
+		got, est := int64(buf.Len()), encryptedSize(n)
+		if est < got || est-got > 128 {
+			t.Errorf("%d bytes: age wrote %d, estimated %d", n, got, est)
+		}
+	}
+}
+
+func TestRoom(t *testing.T) {
+	v, _ := newVault(t)
+	const cluster = 32 << 10
+	v.DiskUsage = func(string) (int64, int64, error) { return 50 << 20, cluster, nil }
+
+	empty, err := v.Room(nil)
+	if err != nil || !empty.Fits() || empty.Err() != nil {
+		t.Fatalf("empty batch: %+v, %v", empty, err)
+	}
+	big, _ := v.Room([]int64{40 << 20})
+	if !big.Fits() || big.Need < empty.Need+40<<20 {
+		t.Errorf("40 MB of 50: %+v", big)
+	}
+	tooBig, _ := v.Room([]int64{30 << 20, 30 << 20})
+	if tooBig.Fits() || !errors.Is(tooBig.Err(), ErrNoSpace) {
+		t.Errorf("60 MB of 50: %+v, %v", tooBig, tooBig.Err())
+	}
+
+	// Small files share packs, so they do not cost a cluster each.
+	small := make([]int64, 1000)
+	for i := range small {
+		small[i] = 1 << 10
+	}
+	packed, _ := v.Room(small)
+	if extra := packed.Need - empty.Need - 1000<<10; extra > 1000*indexEntry+4*cluster {
+		t.Errorf("1000 small files: %d bytes over their size", extra)
+	}
+
+	// What a batch holds in memory still has to reach the card.
+	if _, err := v.PutDeferred(RootID, "a", bytes.NewReader(make([]byte, 500<<10))); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ := v.Room(nil)
+	if pending.Need < empty.Need+500<<10 {
+		t.Errorf("open pack not counted: %d, was %d", pending.Need, empty.Need)
 	}
 }
