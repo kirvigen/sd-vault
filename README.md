@@ -48,7 +48,9 @@ loses only the unflushed uploads; their blobs are swept as orphans. On a slow
 card this halves the time of a folder upload (100 small files: 28.5 s →
 13.5 s), and the gap grows with the index, which every save rewrites whole.
 A replaced blob is removed only after the index stops naming it. The index is
-compact JSON. It rotates to
+compact JSON. "Проверить сейф" (`POST /api/verify`, polled via `GET`) decrypts
+every blob to the end in the background and lists the ones that fail
+authentication or are missing. The index rotates to
 `index.age.bak` on save; if `index.age` is missing or fails authentication,
 the backup is loaded and written back. Blobs are removed only after the index
 stops referencing them; orphans and temp files are swept on the next unlock

@@ -381,6 +381,57 @@ func TestFlushAndCloseWriteDeferred(t *testing.T) {
 	}
 }
 
+func TestVerify(t *testing.T) {
+	v, dir := newVault(t)
+	folder, _ := v.MkdirAll(RootID, "Фото/2024")
+	good, _ := v.Put(folder, "good.jpg", bytes.NewReader(randomBytes(t, 200_000)))
+	flipped, _ := v.Put(folder, "flipped.jpg", bytes.NewReader(randomBytes(t, 200_000)))
+	gone, _ := v.Put(RootID, "gone.txt", strings.NewReader("gone"))
+
+	// One byte in the middle of the second chunk, as a bad card would do.
+	p := filepath.Join(dir, flipped.Blob)
+	data, _ := os.ReadFile(p)
+	data[len(data)-50_000] ^= 1
+	os.WriteFile(p, data, 0o600)
+	os.Remove(filepath.Join(dir, gone.Blob))
+
+	var first, last Progress
+	problems, done, err := v.Verify(func(p Progress) {
+		if first.TotalFiles == 0 {
+			first = p
+		}
+		last = p
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Progress{Files: 3, TotalFiles: 3, Bytes: 400_004, TotalBytes: 400_004}
+	if done != want || last != want {
+		t.Fatalf("done %+v, last progress %+v", done, last)
+	}
+	if first != (Progress{TotalFiles: 3, TotalBytes: 400_004}) {
+		t.Fatalf("first progress %+v: totals must be known from the start", first)
+	}
+	got := map[string]Problem{}
+	for _, pr := range problems {
+		got[pr.Path] = pr
+	}
+	if len(problems) != 2 || got["Фото/2024/flipped.jpg"].ID != flipped.ID || got["gone.txt"].ID != gone.ID {
+		t.Fatalf("problems: %+v", problems)
+	}
+	if !strings.Contains(got["gone.txt"].Err, "пропал") || !strings.Contains(got["Фото/2024/flipped.jpg"].Err, "поврежд") {
+		t.Fatalf("messages: %+v", problems)
+	}
+	if _, ok := got["Фото/2024/good.jpg"]; ok || good.ID == "" {
+		t.Fatal("intact file reported")
+	}
+
+	v.Close()
+	if _, _, err := v.Verify(nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Verify after Close: %v", err)
+	}
+}
+
 func TestNoPlaintextOnDisk(t *testing.T) {
 	v, dir := newVault(t)
 	secret := "SECRET-CONTENT-7f3a9c"

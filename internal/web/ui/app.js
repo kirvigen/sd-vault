@@ -347,6 +347,68 @@ document.addEventListener('drop', async (ev) => {
   if (out.length) enqueue(out);
 });
 
+// ---------- Verify ----------
+
+// The check reads the whole card, which takes minutes on a slow one, so it
+// runs on the server and the page polls it. A reload picks a running check
+// up again; a finished one is reported only to the page that watched it.
+let verifyTimer = 0;
+
+async function startVerify() {
+  try { showVerify(await post('/api/verify', {})); } catch (e) { toast(e.message); }
+}
+
+async function pollVerify() {
+  try { showVerify(await api('/api/verify')); } catch (e) { toast(e.message); }
+}
+
+function showVerify(st) {
+  $('#btn-verify').disabled = st.running;
+  clearTimeout(verifyTimer);
+  if (!st.running) {
+    $('#verify').hidden = true;
+    if (st.started && !state.closed) showReport(st);
+    return;
+  }
+  $('#verify').hidden = false;
+  const current = Math.min(st.files + 1, st.totalFiles);
+  $('#verify-text').textContent = `Проверяю файлы: ${current} из ${st.totalFiles} — прочитано ${size(st.bytes)} из ${size(st.totalBytes)}`;
+  $('#verify-bar').style.width = (st.totalBytes ? Math.floor((st.bytes / st.totalBytes) * 100) : 0) + '%';
+  verifyTimer = setTimeout(pollVerify, 500);
+}
+
+function showReport(st) {
+  const n = st.problems.length;
+  let title, text;
+  if (st.error) {
+    title = 'Проверка прервалась';
+    text = `${st.error}. Проверено файлов: ${st.files} из ${st.totalFiles}.`;
+  } else if (n) {
+    title = `Повреждено файлов: ${n} из ${st.totalFiles}`;
+    text = 'Эти файлы на карте испорчены, расшифровать их нельзя. Если оригиналы есть, удалите испорченные копии ' +
+      'и загрузите заново. Обычно так бывает, если карту вынули без извлечения или если карта неисправна.';
+  } else {
+    title = 'Все файлы целы';
+    text = `Проверено файлов: ${st.totalFiles}, ${size(st.totalBytes)}. Каждый прочитан с карты и расшифрован целиком.`;
+  }
+  $('#report-title').textContent = title;
+  $('#report-text').textContent = text;
+  $('#report-list').replaceChildren(...st.problems.map((p) => {
+    const a = el('a', { href: '#' + p.parent, textContent: p.path });
+    a.onclick = (ev) => { ev.preventDefault(); closeReport(); go(p.parent); };
+    return el('li', {}, a, el('span', { textContent: p.error }));
+  }));
+  $('#report').hidden = false;
+  $('#report-close').focus();
+}
+
+function closeReport() {
+  $('#report').hidden = true;
+}
+
+$('#btn-verify').onclick = startVerify;
+$('#report-close').onclick = closeReport;
+
 // ---------- Viewer ----------
 
 let viewing = null;
@@ -407,6 +469,7 @@ $('#viewer-close').onclick = closeViewer;
 $('#viewer-prev').onclick = () => step(-1);
 $('#viewer-next').onclick = () => step(1);
 document.addEventListener('keydown', (ev) => {
+  if (!$('#report').hidden && ev.key === 'Escape') return closeReport();
   if ($('#viewer').hidden) return;
   if (ev.key === 'Escape') closeViewer();
   else if (ev.key === 'ArrowLeft' && !(ev.target instanceof HTMLMediaElement)) step(-1);
@@ -424,3 +487,4 @@ setInterval(() => {
 }, 4000);
 
 open(location.hash.slice(1)).catch(() => open('').catch((e) => toast(e.message)));
+api('/api/verify').then((st) => st.running && showVerify(st), () => {});

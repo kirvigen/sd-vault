@@ -42,6 +42,19 @@ type Server struct {
 	batchMu      sync.Mutex
 	flushTimer   *time.Timer
 	pendingSince time.Time
+
+	verifyMu sync.Mutex
+	verify   verifyState
+}
+
+// verifyState is the last or running "Проверить сейф". On a slow card it
+// can take many minutes, so it runs in the background and the UI polls it.
+type verifyState struct {
+	vault.Progress
+	Running  bool            `json:"running"`
+	Started  bool            `json:"started"` // false until the first run
+	Problems []vault.Problem `json:"problems"`
+	Err      string          `json:"error,omitempty"`
 }
 
 // Variables so tests can shorten them.
@@ -76,6 +89,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/file/{id}", s.auth(http.HandlerFunc(s.handleFile)))
 	mux.Handle("POST /api/upload", s.auth(http.HandlerFunc(s.handleUpload)))
 	mux.Handle("POST /api/flush", s.auth(http.HandlerFunc(s.handleFlush)))
+	mux.Handle("POST /api/verify", s.auth(http.HandlerFunc(s.handleVerifyStart)))
+	mux.Handle("GET /api/verify", s.auth(http.HandlerFunc(s.handleVerifyStatus)))
 	mux.Handle("POST /api/mkdir", s.auth(http.HandlerFunc(s.handleMkdir)))
 	mux.Handle("POST /api/rename", s.auth(http.HandlerFunc(s.handleRename)))
 	mux.Handle("POST /api/delete", s.auth(http.HandlerFunc(s.handleDelete)))
@@ -275,6 +290,45 @@ func (s *Server) handleFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleVerifyStart(w http.ResponseWriter, r *http.Request) {
+	s.verifyMu.Lock()
+	if !s.verify.Running {
+		s.verify = verifyState{Running: true, Started: true, Problems: []vault.Problem{}}
+		go s.runVerify()
+	}
+	st := s.verify
+	s.verifyMu.Unlock()
+	writeJSON(w, st)
+}
+
+func (s *Server) runVerify() {
+	problems, done, err := s.v.Verify(func(p vault.Progress) {
+		s.verifyMu.Lock()
+		s.verify.Progress = p
+		s.verifyMu.Unlock()
+	})
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
+	s.verify.Running = false
+	s.verify.Progress = done
+	if problems != nil {
+		s.verify.Problems = problems
+	}
+	if err != nil {
+		s.verify.Err = err.Error()
+	}
+}
+
+func (s *Server) handleVerifyStatus(w http.ResponseWriter, r *http.Request) {
+	s.verifyMu.Lock()
+	st := s.verify
+	s.verifyMu.Unlock()
+	if st.Problems == nil {
+		st.Problems = []vault.Problem{}
+	}
+	writeJSON(w, st)
 }
 
 type nameRequest struct {

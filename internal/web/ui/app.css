@@ -116,9 +116,12 @@ main { flex: 1; overflow: auto; padding: 12px 20px 80px; min-width: 0; }
 .icon { width: 20px; text-align: center; flex: none; }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 
-.uploads {
+.dock {
   position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
   width: min(520px, calc(100% - 32px));
+  display: flex; flex-direction: column; gap: 8px;
+}
+.uploads {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
   box-shadow: var(--shadow); padding: 10px 14px;
 }
@@ -155,10 +158,28 @@ main { flex: 1; overflow: auto; padding: 12px 20px 80px; min-width: 0; }
 }
 .viewer-body .note { background: var(--panel); color: var(--text); padding: 20px 24px; border-radius: 10px; text-align: center; max-width: 440px; }
 
+.report { position: fixed; inset: 0; background: rgb(0 0 0 / 0.45); display: grid; place-items: center; z-index: 15; padding: 16px; }
+.report-card {
+  background: var(--panel); border-radius: 12px; box-shadow: var(--shadow); padding: 20px 24px;
+  width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto;
+}
+.report-card h2 { margin: 0 0 8px; font-size: 18px; }
+.report-card p { margin: 0 0 12px; color: var(--muted); }
+.report-card ul { list-style: none; margin: 0 0 12px; padding: 0; border: 1px solid var(--line); border-radius: 8px; }
+.report-card ul:empty { display: none; }
+.report-card li { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.report-card li:last-child { border-bottom: 0; }
+.report-card li a { color: var(--accent); text-decoration: none; word-break: break-word; }
+.report-card li a:hover { text-decoration: underline; }
+.report-card li span { display: block; color: var(--danger); font-size: 13px; }
+.report-actions { display: flex; justify-content: flex-end; }
+button:disabled { opacity: 0.5; cursor: default; }
+button:disabled:hover { background: var(--panel); }
+
 .closed { position: fixed; inset: 0; background: var(--bg); display: grid; place-items: center; text-align: center; z-index: 20; padding: 16px; }
 .closed-icon { font-size: 48px; }
 .closed h1 { margin: 8px 0; font-size: 24px; }
-.closed p { color: var(--muted); }
+.closed p { color: var(--muted); max-width: 480px; margin-inline: auto; }
 
 @media (max-width: 720px) {
   .tree { display: none; }

@@ -117,8 +117,23 @@ func run() error {
 		return fmt.Errorf("последние загрузки не записаны в индекс: %w", err)
 	}
 	v.Close()
-	fmt.Println("Сейф закрыт, все изменения записаны. Карту можно вынимать.")
+	fmt.Println("Сейф закрыт, все изменения записаны.")
+	fmt.Println(ejectHint())
 	return nil
+}
+
+// ejectHint tells how to eject the card on this OS. Pulling it straight out
+// can leave the file table unwritten, and then files overwrite each other.
+func ejectHint() string {
+	how := "«Извлечь» в файловом менеджере"
+	switch runtime.GOOS {
+	case "darwin":
+		how = "значок ⏏ рядом с картой в Finder"
+	case "windows":
+		how = "«Безопасное извлечение устройства» в трее или «Извлечь» в меню карты в Проводнике"
+	}
+	return "Перед тем как вынуть карту, извлеките её: " + how + ".\n" +
+		"Если вынуть сразу, система может не успеть дописать карту, и файлы на ней испортятся."
 }
 
 // offerUpdate asks before installing a newer release and restarts into it.

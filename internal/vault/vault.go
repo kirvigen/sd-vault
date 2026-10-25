@@ -685,3 +685,114 @@ func (v *Vault) Open(id string) (*File, Entry, error) {
 	}
 	return &File{SectionReader: io.NewSectionReader(ra, 0, size), f: f}, entry, nil
 }
+
+// Problem is a stored file that cannot be read back intact.
+type Problem struct {
+	ID     string `json:"id"`
+	Parent string `json:"parent"`
+	Path   string `json:"path"` // "Фото/2024/clip.mp4"
+	Err    string `json:"error"`
+}
+
+// Progress of Verify.
+type Progress struct {
+	Files      int   `json:"files"` // checked so far
+	TotalFiles int   `json:"totalFiles"`
+	Bytes      int64 `json:"bytes"`
+	TotalBytes int64 `json:"totalBytes"`
+}
+
+// Verify decrypts every stored file to the end, so each chunk is
+// authenticated, and reports the files that fail. progress, if set, is
+// called as data is read. Only a closed vault stops it early; damaged files
+// are what it is for.
+func (v *Vault) Verify(progress func(Progress)) (problems []Problem, done Progress, err error) {
+	type item struct {
+		e    Entry
+		path string
+	}
+	v.mu.RLock()
+	if err := v.check(); err != nil {
+		v.mu.RUnlock()
+		return nil, done, err
+	}
+	identity := v.identity
+	var items []item
+	for _, e := range v.idx.Entries {
+		if e.Dir {
+			continue
+		}
+		names := []string{e.Name}
+		for p := e.Parent; p != RootID; {
+			pe, ok := v.idx.Entries[p]
+			if !ok {
+				break
+			}
+			names = append([]string{pe.Name}, names...)
+			p = pe.Parent
+		}
+		items = append(items, item{*e, strings.Join(names, "/")})
+		done.TotalBytes += e.Size
+	}
+	done.TotalFiles = len(items)
+	v.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].path < items[j].path })
+
+	report := func(n int64) {
+		done.Bytes += n
+		if progress != nil {
+			progress(done)
+		}
+	}
+	report(0)
+	for _, it := range items {
+		if v.closed() {
+			return problems, done, ErrClosed
+		}
+		n, err := verifyBlob(filepath.Join(v.dir, filepath.FromSlash(it.e.Blob)), identity, report)
+		if err == nil && n != it.e.Size {
+			err = errors.New("size differs from the index")
+		}
+		if err != nil {
+			problems = append(problems, Problem{ID: it.e.ID, Parent: it.e.Parent, Path: it.path, Err: describe(err)})
+		}
+		done.Files++
+		report(it.e.Size - n) // keep the byte count in step with the total
+	}
+	return problems, done, nil
+}
+
+func (v *Vault) closed() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.idx == nil
+}
+
+func verifyBlob(path string, identity age.Identity, report func(int64)) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r, err := age.Decrypt(f, identity)
+	if err != nil {
+		return 0, err
+	}
+	return io.CopyBuffer(countWriter(report), r, make([]byte, 1<<20))
+}
+
+type countWriter func(int64)
+
+func (c countWriter) Write(p []byte) (int, error) {
+	c(int64(len(p)))
+	return len(p), nil
+}
+
+// describe says what is wrong in the user's words. The cause from age is
+// always the same for them: the bytes on the card are not what was written.
+func describe(err error) string {
+	if errors.Is(err, fs.ErrNotExist) {
+		return "зашифрованный файл пропал с карты"
+	}
+	return "содержимое повреждено"
+}

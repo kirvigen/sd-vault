@@ -270,6 +270,39 @@ func TestBatchFlushesWhenIdle(t *testing.T) {
 	}
 }
 
+func TestVerify(t *testing.T) {
+	e := setup(t)
+	e.upload("", "ok.txt", "ok")
+	lost := e.upload("", "Фото/lost.jpg", "lost")
+	os.Remove(filepath.Join(e.dir, filepath.FromSlash(lost.Blob)))
+
+	resp := e.do("POST", "/api/verify", strings.NewReader("{}"))
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("start: %d", resp.StatusCode)
+	}
+	var st verifyState
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		resp := e.do("GET", "/api/verify", nil)
+		st = verifyState{}
+		json.NewDecoder(resp.Body).Decode(&st)
+		resp.Body.Close()
+		if !st.Running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("verify did not finish")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !st.Started || st.Files != 2 || st.TotalFiles != 2 || st.Err != "" {
+		t.Fatalf("state: %+v", st)
+	}
+	if len(st.Problems) != 1 || st.Problems[0].Path != "Фото/lost.jpg" || st.Problems[0].ID != lost.ID {
+		t.Fatalf("problems: %+v", st.Problems)
+	}
+}
+
 func TestCloseButton(t *testing.T) {
 	e := setup(t)
 	resp := e.do("POST", "/api/close", strings.NewReader("{}"))

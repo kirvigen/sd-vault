@@ -15,6 +15,7 @@
     <button id="btn-upload" type="button">Загрузить файлы</button>
     <button id="btn-upload-dir" type="button">Загрузить папку</button>
     <button id="btn-mkdir" type="button">Новая папка</button>
+    <button id="btn-verify" type="button">Проверить сейф</button>
     <button id="btn-close" type="button" class="danger">Закрыть сейф</button>
   </div>
   <input id="pick-files" type="file" multiple hidden>
@@ -33,9 +34,24 @@
   </main>
 </div>
 
-<div class="uploads" id="uploads" hidden>
-  <div class="uploads-text" id="uploads-text"></div>
-  <div class="progress"><div id="uploads-bar"></div></div>
+<div class="dock">
+  <div class="uploads" id="verify" hidden>
+    <div class="uploads-text" id="verify-text"></div>
+    <div class="progress"><div id="verify-bar"></div></div>
+  </div>
+  <div class="uploads" id="uploads" hidden>
+    <div class="uploads-text" id="uploads-text"></div>
+    <div class="progress"><div id="uploads-bar"></div></div>
+  </div>
+</div>
+
+<div class="report" id="report" hidden role="dialog" aria-modal="true" aria-labelledby="report-title">
+  <div class="report-card">
+    <h2 id="report-title"></h2>
+    <p id="report-text"></p>
+    <ul id="report-list"></ul>
+    <div class="report-actions"><button id="report-close" type="button" class="primary">Понятно</button></div>
+  </div>
 </div>
 
 <div class="toast" id="toast" role="alert" hidden></div>
@@ -56,7 +72,9 @@
   <div>
     <div class="closed-icon" aria-hidden="true">🔒</div>
     <h1>Сейф закрыт</h1>
-    <p>Все изменения записаны. Вкладку можно закрыть, а карту — вынуть.</p>
+    <p>Все изменения записаны, вкладку можно закрыть.</p>
+    <p>Перед тем как вынуть карту, извлеките её: ⏏ в Finder на Mac или «Безопасное извлечение» в Windows.
+      Если вынуть сразу, система может не успеть дописать карту, и файлы на ней испортятся.</p>
   </div>
 </div>
 </body>
