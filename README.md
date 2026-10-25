@@ -28,33 +28,58 @@ Everything on disk is a standard [age](https://age-encryption.org) file:
 | `index.age` | JSON: entries with id, parent, name, size, blob path | the identity |
 | `index.age.bak` | previous index | the identity |
 | `blobs/ab/<128-bit id>.age` | one file's content | the identity |
+| `packs/<128-bit id>.age` | small files back to back; the index has `pack`, `offset`, `size` | the identity |
 
 The password unlocks only `key.age`, which is age's own
 "passphrase-protected identity file" pattern. Scrypt runs once per unlock
 instead of per file, and `age.DecryptReaderAt` gives random access into big
 files, so video seeking via HTTP Range does not decrypt the whole file.
 The age CLI reads such identity files natively:
-`age -d -i vault/key.age vault/blobs/…`. `TestStandardAgeCLI` checks this
-with the official binaries.
+`age -d -i vault/key.age vault/blobs/…`; a packed file is the slice
+`[offset, offset+size)` of the decrypted pack. `TestStandardAgeCLI` checks
+both with the official binaries.
+
+### Packs
+
+On a card the cost of a file is its creation, not its bytes: FAT entries, an
+fsync, and on macOS an AppleDouble `._` companion that holds the
+`com.apple.provenance` attribute. So a batch upload (`PutDeferred`) gathers
+files up to 1 MiB in memory and writes them as one pack once it reaches
+8 MiB or on the next commit; until then its members are served from memory.
+Bigger files keep a blob each. Packs are age files like blobs, and the 64 KiB
+STREAM chunks keep random access into them. A pack is removed when its last
+member is deleted or replaced; space of removed members inside a live pack
+is not reclaimed (only files up to 1 MiB are packed, so that stays small).
+Index version 2 marks the format; older programs cannot read packed files.
+Existing blobs stay as they are.
+
+On the 2 GB test card, 200 files of 10 KB took 190 s with a blob each and
+5.4 s packed, and the next unlock 7.4 s and 0.5 s.
 
 ## Durability
 
-Every write goes to a temp file in the same directory, then fsync, rename
-and directory fsync (where the OS allows it). Mkdir, rename and delete save
+Every write goes to a temp file in the same directory, then rename. Index
+and key writes, and blobs of immediate puts, are fsynced before the rename
+and the directory after it (where the OS allows it). Batch uploads write
+packs and blobs without fsync; the commit that first names them in the
+index syncs them all first, one fsync per batch instead of per file, so the
+index on disk never points at content a pulled card could lose. Mkdir, rename and delete save
 the index before returning. Uploads from the UI (`batch=1`) change it only in
 memory: it is written once on `/api/flush` after the upload queue, after 3 s
 without uploads, at least every 30 s, and on close. A card pulled mid-batch
-loses only the unflushed uploads; their blobs are swept as orphans. On a slow
-card this halves the time of a folder upload (100 small files: 28.5 s →
-13.5 s), and the gap grows with the index, which every save rewrites whole.
-A replaced blob is removed only after the index stops naming it. The index is
+loses only the unflushed uploads; their blobs and packs are swept as orphans.
+Replaced content is removed only after the index stops naming it. The index is
 compact JSON. "Проверить сейф" (`POST /api/verify`, polled via `GET`) decrypts
-every blob to the end in the background and lists the ones that fail
-authentication or are missing. The index rotates to
+every blob and pack to the end in the background and lists the files that
+fail authentication or are missing; in a pack with a bad chunk only the
+members in that chunk are reported. The index rotates to
 `index.age.bak` on save; if `index.age` is missing or fails authentication,
 the backup is loaded and written back. Blobs are removed only after the index
 stops referencing them; orphans and temp files are swept on the next unlock
-(only when the primary index loaded, so a fallback never deletes data).
+(only when the primary index loaded, so a fallback never deletes data). The
+sweep leaves `._*` files alone: they are macOS's, it removes each with its
+file, and deleting 4400 of them one by one once kept an unlock busy for six
+minutes.
 
 ## Updates and releases
 

@@ -19,7 +19,8 @@ age (https://age-encryption.org) и на карте всегда лежат то
     key.age             ключ сейфа, зашифрованный вашим паролем
     index.age           зашифрованный список: имена файлов и папок
     index.age.bak       предыдущая версия списка, на случай сбоя
-    blobs/              зашифрованные файлы, по одному на каждый ваш файл
+    blobs/              большие файлы (больше 1 МБ), каждый отдельно
+    packs/              мелкие файлы, упакованные пачками до 8 МБ
 
 Все программы работают с одной и той же папкой vault/.
 
@@ -157,19 +158,35 @@ https://github.com/FiloSottile/age/releases).
      age -d -i vault/key.age vault/index.age > index.json
 
    В index.json у каждого элемента есть "name" (имя), "parent" (id папки,
-   пустой — корень), "dir": true у папок и "blob" — путь к зашифрованному
-   содержимому, например "blobs/3f/3fa1c0….age".
+   пустой — корень), "dir": true у папок и "size" (размер). Где лежит
+   содержимое, говорит одно из двух:
+     "blob": "blobs/3f/3fa1c0….age"         — файл целиком в своём файле;
+     "pack": "packs/9c2e….age", "offset": N — файл внутри пачки, с байта N.
 
-2. Нужный файл (спросит пароль):
+2. Нужный файл (спросит пароль).
+
+   Если у файла "blob":
 
      age -d -i vault/key.age -o "имя-файла.jpg" vault/blobs/3f/3fa1c0….age
+
+   Если у файла "pack": расшифровать пачку и вырезать из неё size байт,
+   начиная с offset. macOS и Linux (подставьте offset и size из index.json):
+
+     age -d -i vault/key.age vault/packs/9c2e….age | tail -c +$((offset+1)) | head -c size > "имя-файла.txt"
+
+   Windows (PowerShell):
+
+     age -d -i vault\key.age -o pack.bin vault\packs\9c2e….age
+     $b = [IO.File]::ReadAllBytes("pack.bin")
+     [IO.File]::WriteAllBytes("имя-файла.txt", $b[offset..(offset+size-1)])
+     del pack.bin
 
 Чтобы не вводить пароль на каждый файл, можно один раз расшифровать ключ:
 
      age -d vault/key.age > key.txt
      age -d -i key.txt -o "имя-файла.jpg" vault/blobs/3f/3fa1c0….age
 
-key.txt и index.json — ОТКРЫТЫЙ ТЕКСТ: key.txt открывает весь сейф без
-пароля. Удалите их сразу после работы.
+key.txt, index.json и pack.bin — ОТКРЫТЫЙ ТЕКСТ: key.txt открывает весь
+сейф без пароля. Удалите их сразу после работы.
 
 Если index.age повреждён, то же самое работает с index.age.bak.

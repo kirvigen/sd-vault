@@ -18,13 +18,25 @@ const tmpMarker = ".tmp-"
 // card pulled out mid-write) sees either the old file or the new one, never a
 // half-written mix.
 func writeAtomic(path string, write func(w io.Writer) error) error {
-	return writeAtomicKeepingBackup(path, "", write)
+	return writeFile(path, "", true, write)
 }
 
 // writeAtomicKeepingBackup is writeAtomic that, when backup is set, first
 // moves the current file to backup. If the process dies between the two
 // renames, path is missing and the loader falls back to backup.
-func writeAtomicKeepingBackup(path, backup string, write func(w io.Writer) error) (err error) {
+func writeAtomicKeepingBackup(path, backup string, write func(w io.Writer) error) error {
+	return writeFile(path, backup, true, write)
+}
+
+// writeUnsynced is writeAtomic without the fsyncs, for content that nothing
+// names yet: the commit that adds it to the index syncs it first. Until
+// then a pulled card can leave it partly written, and the next unlock
+// removes it as garbage.
+func writeUnsynced(path string, write func(w io.Writer) error) error {
+	return writeFile(path, "", false, write)
+}
+
+func writeFile(path, backup string, sync bool, write func(w io.Writer) error) (err error) {
 	dir := filepath.Dir(path)
 	tmp := path + tmpMarker + randomHex(6)
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -40,8 +52,10 @@ func writeAtomicKeepingBackup(path, backup string, write func(w io.Writer) error
 	if err = write(f); err != nil {
 		return err
 	}
-	if err = f.Sync(); err != nil {
-		return err
+	if sync {
+		if err = f.Sync(); err != nil {
+			return err
+		}
 	}
 	if err = f.Close(); err != nil {
 		return err
@@ -56,7 +70,9 @@ func writeAtomicKeepingBackup(path, backup string, write func(w io.Writer) error
 	if err = os.Rename(tmp, path); err != nil {
 		return err
 	}
-	syncDir(dir)
+	if sync {
+		syncDir(dir)
+	}
 	return nil
 }
 

@@ -6,6 +6,13 @@
 //	index.age           JSON index: names, folders, sizes, blob paths
 //	index.age.bak       previous index, used if index.age is missing or damaged
 //	blobs/ab/<id>.age   one file per stored file, encrypted to the identity
+//	packs/<id>.age      many small files back to back, encrypted to the identity
+//
+// A card spends far more time on creating a file (FAT entries, an fsync,
+// and on macOS an AppleDouble "._" companion for the provenance attribute)
+// than on its bytes. So small files of a batch upload are gathered in memory
+// and written as one pack; the index keeps each file's offset in the pack's
+// plaintext, and age's 64 KiB chunks still give random access into it.
 //
 // The password only unlocks key.age, so scrypt runs once per unlock instead of
 // once per file, and random access into big files (video seeking) stays cheap.
@@ -38,6 +45,13 @@ const (
 	indexFile = "index.age"
 	indexBak  = "index.age.bak"
 	blobsDir  = "blobs"
+	packsDir  = "packs"
+
+	// packFileMax is the largest file a deferred put packs; bigger ones
+	// get a blob of their own. packMax is the plaintext size at which the
+	// open pack is written out. Both bound the memory a batch holds.
+	packFileMax = 1 << 20
+	packMax     = 8 << 20
 
 	// RootID is the ID of the top-level folder.
 	RootID = ""
@@ -66,7 +80,15 @@ type Entry struct {
 	// Blob is the encrypted content, relative to the vault folder, with
 	// forward slashes: "blobs/ab/ab12….age".
 	Blob string `json:"blob,omitempty"`
+	// Pack, when set instead of Blob, is the pack holding the content at
+	// Offset of its plaintext: "packs/cd34….age".
+	Pack   string `json:"pack,omitempty"`
+	Offset int64  `json:"offset,omitempty"`
 }
+
+// indexVersion 2 added packs. Older programs ignore the version and cannot
+// read packed files, so an update is one way.
+const indexVersion = 2
 
 type index struct {
 	Version int               `json:"version"`
@@ -85,6 +107,19 @@ type Vault struct {
 	// doomed are blobs that deferred puts replaced. They are removed only
 	// once an index that no longer names them is on disk.
 	doomed []string
+	// emptied are packs that lost a member; each is removed at the next
+	// commit if no entry uses it any more.
+	emptied map[string]bool
+	// open is the pack being gathered in memory, nil when there is none.
+	open *openPack
+	// unsynced are files written without fsync by deferred puts. The next
+	// commit syncs them before the index that names them.
+	unsynced map[string]bool
+}
+
+type openPack struct {
+	path string // "packs/<id>.age"
+	buf  []byte // plaintext of the members, back to back
 }
 
 // Exists reports whether dir already holds a vault.
@@ -122,7 +157,7 @@ func Create(dir, password string) (*Vault, error) {
 	if err != nil {
 		return nil, err
 	}
-	v := &Vault{dir: dir, identity: identity, idx: &index{Version: 1, Entries: map[string]*Entry{}}}
+	v := &Vault{dir: dir, identity: identity, idx: &index{Version: indexVersion, Entries: map[string]*Entry{}}}
 	if err := v.saveIndex(); err != nil {
 		return nil, err
 	}
@@ -204,6 +239,7 @@ func (v *Vault) loadIndex(name string) (*index, error) {
 
 // saveIndex must be called with mu held for writing (or before v is shared).
 func (v *Vault) saveIndex() error {
+	v.idx.Version = indexVersion
 	data, err := json.Marshal(v.idx)
 	if err != nil {
 		return err
@@ -222,19 +258,132 @@ func (v *Vault) saveIndex() error {
 
 // commit makes the index change durable, or, when deferred, only marks it
 // for the next Flush. mu must be held for writing.
+//
+// A durable commit writes the open pack, syncs every file deferred puts
+// wrote without fsync, and only then saves the index, so the index on disk
+// never names content that a pulled card could lose. One fsync per batch
+// instead of one per file is most of what makes a batch fast on a card.
 func (v *Vault) commit(deferred bool) error {
 	if deferred {
 		v.dirty = true
 		return nil
+	}
+	if err := v.sealPack(); err != nil {
+		return err
+	}
+	if err := v.syncWritten(); err != nil {
+		return err
 	}
 	if err := v.saveIndex(); err != nil {
 		return err
 	}
 	v.dirty = false
 	for _, b := range v.doomed {
-		os.Remove(filepath.Join(v.dir, filepath.FromSlash(b)))
+		os.Remove(v.abs(b))
 	}
 	v.doomed = nil
+	if len(v.emptied) > 0 {
+		used := v.usedPacks()
+		for p := range v.emptied {
+			if !used[p] {
+				os.Remove(v.abs(p))
+			}
+		}
+		v.emptied = nil
+	}
+	return nil
+}
+
+func (v *Vault) abs(rel string) string {
+	return filepath.Join(v.dir, filepath.FromSlash(rel))
+}
+
+func (v *Vault) usedPacks() map[string]bool {
+	used := map[string]bool{}
+	for _, e := range v.idx.Entries {
+		if e.Pack != "" {
+			used[e.Pack] = true
+		}
+	}
+	return used
+}
+
+// forget marks the content of an entry that is being replaced or deleted
+// for removal after the next durable commit.
+func (v *Vault) forget(e Entry) {
+	switch {
+	case e.Blob != "":
+		v.doomed = append(v.doomed, e.Blob)
+	case e.Pack != "":
+		if v.emptied == nil {
+			v.emptied = map[string]bool{}
+		}
+		v.emptied[e.Pack] = true
+	}
+}
+
+// sealPack encrypts the open pack to the card. A pack whose members were all
+// replaced or deleted meanwhile is dropped instead. mu must be held for
+// writing.
+func (v *Vault) sealPack() error {
+	p := v.open
+	if p == nil {
+		return nil
+	}
+	if !v.usedPacks()[p.path] {
+		v.open = nil
+		return nil
+	}
+	full := v.abs(p.path)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		return err
+	}
+	err := writeUnsynced(full, func(w io.Writer) error {
+		ew, err := age.Encrypt(w, v.identity.Recipient())
+		if err != nil {
+			return err
+		}
+		if _, err := ew.Write(p.buf); err != nil {
+			return err
+		}
+		return ew.Close()
+	})
+	if err != nil {
+		return err
+	}
+	v.markUnsynced(full)
+	v.open = nil
+	return nil
+}
+
+func (v *Vault) markUnsynced(full string) {
+	if v.unsynced == nil {
+		v.unsynced = map[string]bool{}
+	}
+	v.unsynced[full] = true
+}
+
+// syncWritten makes the files deferred puts wrote, and their renames,
+// durable. On macOS each fsync is a full flush of the card's cache, so after
+// the first one the rest find nothing to write.
+func (v *Vault) syncWritten() error {
+	dirs := map[string]bool{}
+	for full := range v.unsynced {
+		f, err := os.Open(full)
+		if err != nil {
+			return err
+		}
+		err = f.Sync()
+		f.Close()
+		if err != nil {
+			return err
+		}
+		dirs[filepath.Dir(full)] = true
+	}
+	for d := range dirs {
+		syncDir(d)
+	}
+	v.unsynced = nil
 	return nil
 }
 
@@ -252,9 +401,12 @@ func (v *Vault) Flush() error {
 }
 
 // collectGarbage removes what an interrupted operation left behind:
-// temporary files and blobs that no index entry points to.
+// temporary files, and blobs and packs that no index entry points to.
+// AppleDouble files ("._x.age", where macOS keeps attributes on FAT) are not
+// ours: macOS removes each one with its file, and deleting them one by one
+// once took minutes on a slow card.
 func (v *Vault) collectGarbage() {
-	used := map[string]bool{}
+	used := v.usedPacks()
 	for _, e := range v.idx.Entries {
 		if e.Blob != "" {
 			used[e.Blob] = true
@@ -266,8 +418,8 @@ func (v *Vault) collectGarbage() {
 			os.Remove(filepath.Join(v.dir, de.Name()))
 		}
 	}
-	filepath.WalkDir(filepath.Join(v.dir, blobsDir), func(p string, de fs.DirEntry, err error) error {
-		if err != nil || de.IsDir() {
+	sweep := func(p string, de fs.DirEntry, err error) error {
+		if err != nil || de.IsDir() || strings.HasPrefix(de.Name(), "._") {
 			return nil
 		}
 		rel, err := filepath.Rel(v.dir, p)
@@ -278,7 +430,9 @@ func (v *Vault) collectGarbage() {
 			os.Remove(p)
 		}
 		return nil
-	})
+	}
+	filepath.WalkDir(filepath.Join(v.dir, blobsDir), sweep)
+	filepath.WalkDir(filepath.Join(v.dir, packsDir), sweep)
 }
 
 // Close writes pending deferred changes and forgets the key and the index.
@@ -488,6 +642,20 @@ func (v *Vault) put(parentID, name string, r io.Reader, deferred bool) (Entry, e
 	if err := validName(name); err != nil {
 		return Entry{}, err
 	}
+	if deferred {
+		// Small files go to the open pack. Reading one byte past the limit
+		// tells a small file from a big one without knowing the size.
+		head := make([]byte, packFileMax+1)
+		n, err := io.ReadFull(r, head)
+		switch err {
+		case io.EOF, io.ErrUnexpectedEOF:
+			return v.putPacked(parentID, name, head[:n])
+		case nil:
+			r = io.MultiReader(bytes.NewReader(head), r)
+		default:
+			return Entry{}, err
+		}
+	}
 	v.mu.RLock()
 	err := v.check()
 	var recipient age.Recipient
@@ -511,8 +679,12 @@ func (v *Vault) put(parentID, name string, r io.Reader, deferred bool) (Entry, e
 	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 		return Entry{}, err
 	}
+	write := writeAtomic
+	if deferred {
+		write = writeUnsynced
+	}
 	var size int64
-	err = writeAtomic(full, func(w io.Writer) error {
+	err = write(full, func(w io.Writer) error {
 		ew, err := age.Encrypt(w, recipient)
 		if err != nil {
 			return err
@@ -543,24 +715,71 @@ func (v *Vault) put(parentID, name string, r io.Reader, deferred bool) (Entry, e
 	if old != nil && old.Dir {
 		return fail(ErrIsDir)
 	}
+	if err := v.store(e, old, deferred); err != nil {
+		return fail(err)
+	}
+	if deferred {
+		v.markUnsynced(full)
+	}
+	return *e, nil
+}
+
+// store adds e to the index, replacing old if set, and commits. On failure
+// the index is as before. mu must be held for writing.
+func (v *Vault) store(e, old *Entry, deferred bool) error {
 	if old != nil {
 		e.ID = old.ID
 		prev := *old
 		*old = *e
-		// The old blob goes only after the index stops naming it.
-		v.doomed = append(v.doomed, prev.Blob)
+		// The old content goes only after the index stops naming it.
+		doomed := len(v.doomed)
+		v.forget(prev)
 		if err := v.commit(deferred); err != nil {
-			v.doomed = v.doomed[:len(v.doomed)-1]
+			v.doomed = v.doomed[:doomed]
 			*old = prev
-			return fail(err)
+			return err
 		}
-		return *old, nil
+		*e = *old
+		return nil
 	}
 	e.ID = v.newID()
 	v.idx.Entries[e.ID] = e
 	if err := v.commit(deferred); err != nil {
 		delete(v.idx.Entries, e.ID)
-		return fail(err)
+		return err
+	}
+	return nil
+}
+
+// putPacked appends a small file to the open pack. Until the pack is sealed
+// its members are read from memory, so they are listed and readable at once.
+func (v *Vault) putPacked(parentID, name string, data []byte) (Entry, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if err := v.check(); err != nil {
+		return Entry{}, err
+	}
+	if _, err := v.getDir(parentID); err != nil {
+		return Entry{}, err
+	}
+	old := v.child(parentID, name)
+	if old != nil && old.Dir {
+		return Entry{}, ErrIsDir
+	}
+	if v.open == nil {
+		v.open = &openPack{path: path.Join(packsDir, randomHex(16)+".age")}
+	}
+	p := v.open
+	e := &Entry{Parent: parentID, Name: name, Size: int64(len(data)), Modified: time.Now().UTC(),
+		Pack: p.path, Offset: int64(len(p.buf))}
+	p.buf = append(p.buf, data...)
+	if err := v.store(e, old, true); err != nil {
+		return Entry{}, err
+	}
+	if len(p.buf) >= packMax {
+		if err := v.sealPack(); err != nil {
+			return Entry{}, err
+		}
 	}
 	return *e, nil
 }
@@ -618,21 +837,19 @@ func (v *Vault) Delete(id string) error {
 		}
 	}
 	walk(id)
-	for did := range doomed {
+	// Content goes only after the index no longer points at it. If the card
+	// is pulled in between, the next unlock collects it as garbage.
+	before := len(v.doomed)
+	for did, e := range doomed {
 		delete(v.idx.Entries, did)
+		v.forget(*e)
 	}
 	if err := v.commit(false); err != nil {
+		v.doomed = v.doomed[:before]
 		for did, e := range doomed {
 			v.idx.Entries[did] = e
 		}
 		return err
-	}
-	// Blobs go only after the index no longer points at them. If the card is
-	// pulled in between, the next unlock collects them as garbage.
-	for _, e := range doomed {
-		if e.Blob != "" {
-			os.Remove(filepath.Join(v.dir, filepath.FromSlash(e.Blob)))
-		}
 	}
 	return nil
 }
@@ -640,10 +857,15 @@ func (v *Vault) Delete(id string) error {
 // File is decrypted content with random access. Close it when done.
 type File struct {
 	*io.SectionReader
-	f *os.File
+	f *os.File // nil for a member of the pack still in memory
 }
 
-func (f *File) Close() error { return f.f.Close() }
+func (f *File) Close() error {
+	if f.f == nil {
+		return nil
+	}
+	return f.f.Close()
+}
 
 // Open decrypts a stored file for reading. Chunks are decrypted on demand,
 // so seeking into a large video does not decrypt what comes before it.
@@ -658,32 +880,59 @@ func (v *Vault) Open(id string) (*File, Entry, error) {
 		identity = v.identity
 	}
 	var entry Entry
+	var inMemory []byte
 	if err == nil {
 		entry = *e
 		if entry.Dir {
 			err = ErrIsDir
+		} else if v.open != nil && entry.Pack == v.open.path {
+			// Appending to buf never changes bytes already in it, so the
+			// slice stays valid after the lock is released.
+			inMemory = v.open.buf[entry.Offset : entry.Offset+entry.Size]
 		}
 	}
 	v.mu.RUnlock()
 	if err != nil {
 		return nil, Entry{}, err
 	}
+	if inMemory != nil {
+		return &File{SectionReader: io.NewSectionReader(bytes.NewReader(inMemory), 0, entry.Size)}, entry, nil
+	}
 
-	f, err := os.Open(filepath.Join(v.dir, filepath.FromSlash(entry.Blob)))
+	content, offset := entry.Blob, int64(0)
+	if entry.Pack != "" {
+		content, offset = entry.Pack, entry.Offset
+	}
+	f, ra, size, err := openAge(v.abs(content), identity)
 	if err != nil {
-		return nil, Entry{}, err
+		return nil, Entry{}, fmt.Errorf("файл повреждён: %w", err)
+	}
+	if entry.Pack == "" {
+		entry.Size = size
+	} else if offset+entry.Size > size {
+		f.Close()
+		return nil, Entry{}, fmt.Errorf("файл повреждён: пакет короче записи")
+	}
+	return &File{SectionReader: io.NewSectionReader(ra, offset, entry.Size), f: f}, entry, nil
+}
+
+// openAge opens an age file for random access to its plaintext.
+func openAge(full string, identity age.Identity) (*os.File, io.ReaderAt, int64, error) {
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, Entry{}, err
+		return nil, nil, 0, err
 	}
 	ra, size, err := age.DecryptReaderAt(f, st.Size(), identity)
 	if err != nil {
 		f.Close()
-		return nil, Entry{}, fmt.Errorf("файл повреждён: %w", err)
+		return nil, nil, 0, err
 	}
-	return &File{SectionReader: io.NewSectionReader(ra, 0, size), f: f}, entry, nil
+	return f, ra, size, nil
 }
 
 // Problem is a stored file that cannot be read back intact.
@@ -705,8 +954,12 @@ type Progress struct {
 // Verify decrypts every stored file to the end, so each chunk is
 // authenticated, and reports the files that fail. progress, if set, is
 // called as data is read. Only a closed vault stops it early; damaged files
-// are what it is for.
+// are what it is for. Pending deferred changes are written first: the check
+// is of what is on the card.
 func (v *Vault) Verify(progress func(Progress)) (problems []Problem, done Progress, err error) {
+	if err := v.Flush(); err != nil {
+		return nil, done, err
+	}
 	type item struct {
 		e    Entry
 		path string
@@ -717,7 +970,9 @@ func (v *Vault) Verify(progress func(Progress)) (problems []Problem, done Progre
 		return nil, done, err
 	}
 	identity := v.identity
-	var items []item
+	var blobs []item
+	packs := map[string][]Entry{}
+	paths := map[string]string{}
 	for _, e := range v.idx.Entries {
 		if e.Dir {
 			continue
@@ -731,12 +986,16 @@ func (v *Vault) Verify(progress func(Progress)) (problems []Problem, done Progre
 			names = append([]string{pe.Name}, names...)
 			p = pe.Parent
 		}
-		items = append(items, item{*e, strings.Join(names, "/")})
+		paths[e.ID] = strings.Join(names, "/")
+		if e.Pack != "" {
+			packs[e.Pack] = append(packs[e.Pack], *e)
+		} else {
+			blobs = append(blobs, item{*e, paths[e.ID]})
+		}
+		done.TotalFiles++
 		done.TotalBytes += e.Size
 	}
-	done.TotalFiles = len(items)
 	v.mu.RUnlock()
-	sort.Slice(items, func(i, j int) bool { return items[i].path < items[j].path })
 
 	report := func(n int64) {
 		done.Bytes += n
@@ -744,22 +1003,120 @@ func (v *Vault) Verify(progress func(Progress)) (problems []Problem, done Progre
 			progress(done)
 		}
 	}
+	bad := func(e Entry, err error) {
+		problems = append(problems, Problem{ID: e.ID, Parent: e.Parent, Path: paths[e.ID], Err: describe(err)})
+	}
 	report(0)
-	for _, it := range items {
+
+	packNames := make([]string, 0, len(packs))
+	for p := range packs {
+		packNames = append(packNames, p)
+	}
+	sort.Strings(packNames)
+	for _, p := range packNames {
 		if v.closed() {
 			return problems, done, ErrClosed
 		}
-		n, err := verifyBlob(filepath.Join(v.dir, filepath.FromSlash(it.e.Blob)), identity, report)
+		members := packs[p]
+		sort.Slice(members, func(i, j int) bool { return members[i].Offset < members[j].Offset })
+		for i, err := range verifyPack(v.abs(p), identity, members, func(n int64) { report(n) }) {
+			if err != nil {
+				bad(members[i], err)
+			}
+		}
+		done.Files += len(members)
+		report(0)
+	}
+
+	sort.Slice(blobs, func(i, j int) bool { return blobs[i].path < blobs[j].path })
+	for _, it := range blobs {
+		if v.closed() {
+			return problems, done, ErrClosed
+		}
+		n, err := verifyBlob(v.abs(it.e.Blob), identity, report)
 		if err == nil && n != it.e.Size {
 			err = errors.New("size differs from the index")
 		}
 		if err != nil {
-			problems = append(problems, Problem{ID: it.e.ID, Parent: it.e.Parent, Path: it.path, Err: describe(err)})
+			bad(it.e, err)
 		}
 		done.Files++
 		report(it.e.Size - n) // keep the byte count in step with the total
 	}
+	sort.Slice(problems, func(i, j int) bool { return problems[i].Path < problems[j].Path })
 	return problems, done, nil
+}
+
+// verifyPack checks the members of one pack, sorted by offset, and returns
+// an error, or nil, for each. The pack is read once from start to end; only
+// when that fails are the members past the failure read one by one, so a
+// damaged chunk condemns just the files it holds. report gets each member's
+// size once.
+func verifyPack(full string, identity age.Identity, members []Entry, report func(int64)) []error {
+	errs := make([]error, len(members))
+	reported := 0
+	reportUpTo := func(k int) {
+		for ; reported < k; reported++ {
+			report(members[reported].Size)
+		}
+	}
+	defer reportUpTo(len(members))
+
+	f, err := os.Open(full)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
+	}
+	defer f.Close()
+	r, err := age.Decrypt(f, identity)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
+	}
+	buf := make([]byte, 1<<20)
+	var pos int64
+	next := 0 // first member not yet fully read
+	for {
+		n, rerr := r.Read(buf)
+		pos += int64(n)
+		for next < len(members) && members[next].Offset+members[next].Size <= pos {
+			next++
+		}
+		reportUpTo(next)
+		if rerr == io.EOF {
+			for i := next; i < len(members); i++ {
+				errs[i] = errors.New("pack shorter than the index says")
+			}
+			return errs
+		}
+		if rerr != nil {
+			break
+		}
+	}
+
+	// The stream stopped at a bad chunk. Members before it are fine; each of
+	// the others is read on its own, which skips the bad chunk.
+	pf, ra, size, err := openAge(full, identity)
+	if err == nil {
+		defer pf.Close()
+	}
+	for i := next; i < len(members); i++ {
+		m := members[i]
+		switch {
+		case err != nil:
+			errs[i] = err
+		case m.Offset+m.Size > size:
+			errs[i] = errors.New("pack shorter than the index says")
+		default:
+			_, errs[i] = io.CopyBuffer(io.Discard, io.NewSectionReader(ra, m.Offset, m.Size), buf)
+		}
+		reportUpTo(i + 1)
+	}
+	return errs
 }
 
 func (v *Vault) closed() bool {

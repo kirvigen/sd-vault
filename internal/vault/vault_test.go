@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -376,8 +377,9 @@ func TestFlushAndCloseWriteDeferred(t *testing.T) {
 		t.Fatalf("a.txt: %q", got)
 	}
 	findByName(t, v, RootID, "b.txt")
-	if n := countFiles(t, filepath.Join(dir, blobsDir)); n != 2 {
-		t.Fatalf("%d blobs, want 2", n)
+	// Each flush sealed a pack of its own; the replaced blob is gone.
+	if b, p := countFiles(t, filepath.Join(dir, blobsDir)), countFiles(t, filepath.Join(dir, packsDir)); b != 0 || p != 2 {
+		t.Fatalf("%d blobs and %d packs, want 0 and 2", b, p)
 	}
 }
 
@@ -429,6 +431,213 @@ func TestVerify(t *testing.T) {
 	v.Close()
 	if _, _, err := v.Verify(nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Verify after Close: %v", err)
+	}
+}
+
+func readRange(t *testing.T, v *Vault, id string, off, n int64) []byte {
+	t.Helper()
+	f, _, err := v.Open(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	b := make([]byte, n)
+	if _, err := f.ReadAt(b, off); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestPacks(t *testing.T) {
+	v, dir := newVault(t)
+	want := map[string][]byte{}
+	ids := map[string]string{}
+	put := func(folder, name string, data []byte) {
+		t.Helper()
+		parent, err := v.MkdirAllDeferred(RootID, folder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, err := v.PutDeferred(parent, name, bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want[folder+"/"+name], ids[folder+"/"+name] = data, e.ID
+	}
+	for i := 0; i < 300; i++ {
+		put(fmt.Sprintf("Заметки/%d", i%7), fmt.Sprintf("n%03d.txt", i), randomBytes(t, 1+i*37))
+	}
+	put("Видео", "big.mp4", randomBytes(t, packFileMax+1)) // one byte over: a blob
+	put("Видео", "edge.bin", randomBytes(t, packFileMax))  // exactly the limit: packed
+
+	// Before the flush the small files live only in memory and still read.
+	if n := countFiles(t, filepath.Join(dir, packsDir)); n != 0 {
+		t.Fatalf("%d packs written before flush", n)
+	}
+	if got := readAll(t, v, ids["Заметки/5/n005.txt"]); !bytes.Equal(got, want["Заметки/5/n005.txt"]) {
+		t.Fatal("in-memory member reads wrong")
+	}
+	if err := v.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if b, p := countFiles(t, filepath.Join(dir, blobsDir)), countFiles(t, filepath.Join(dir, packsDir)); b != 1 || p != 1 {
+		t.Fatalf("%d blobs and %d packs, want 1 and 1", b, p)
+	}
+
+	v = reopen(t, v, dir)
+	for path, data := range want {
+		if got := readAll(t, v, ids[path]); !bytes.Equal(got, data) {
+			t.Fatalf("%s reads wrong after reopen", path)
+		}
+	}
+	// Random access into a packed file, across a 64 KiB chunk boundary.
+	edge := want["Видео/edge.bin"]
+	if got := readRange(t, v, ids["Видео/edge.bin"], 65_000, 2_000); !bytes.Equal(got, edge[65_000:67_000]) {
+		t.Fatal("ranged read of a packed file is wrong")
+	}
+
+	// Deleting some members keeps the pack; deleting the rest removes it.
+	notes := findByName(t, v, RootID, "Заметки")
+	if err := v.Delete(notes.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n := countFiles(t, filepath.Join(dir, packsDir)); n != 1 {
+		t.Fatalf("%d packs after deleting some members, want 1", n)
+	}
+	if got := readAll(t, v, ids["Видео/edge.bin"]); !bytes.Equal(got, edge) {
+		t.Fatal("surviving member reads wrong")
+	}
+	if err := v.Delete(ids["Видео/edge.bin"]); err != nil {
+		t.Fatal(err)
+	}
+	if n := countFiles(t, filepath.Join(dir, packsDir)); n != 0 {
+		t.Fatalf("%d packs after deleting every member, want 0", n)
+	}
+}
+
+func TestPackSplitsAndReplace(t *testing.T) {
+	v, dir := newVault(t)
+	data := map[string][]byte{}
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("f%02d", i)
+		data[name] = randomBytes(t, 900_000)
+		if _, err := v.PutDeferred(RootID, name, bytes.NewReader(data[name])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A pack is sealed once it reaches 8 MiB: 10 members of 900 KB each.
+	if n := countFiles(t, filepath.Join(dir, packsDir)); n != 2 {
+		t.Fatalf("%d packs sealed during the batch, want 2", n)
+	}
+	// Replacing every member of the first pack empties it.
+	for i := 0; i < 10; i++ {
+		name := fmt.Sprintf("f%02d", i)
+		data[name] = []byte("replaced " + name)
+		if _, err := v.PutDeferred(RootID, name, bytes.NewReader(data[name])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	v = reopen(t, v, dir)
+	if n := countFiles(t, filepath.Join(dir, packsDir)); n != 2 {
+		t.Fatalf("%d packs, want 2: the emptied one removed, a new one for the replacements", n)
+	}
+	for name, want := range data {
+		if got := readAll(t, v, findByName(t, v, RootID, name).ID); !bytes.Equal(got, want) {
+			t.Fatalf("%s reads wrong", name)
+		}
+	}
+}
+
+func TestUnflushedPackIsLostCleanly(t *testing.T) {
+	v, dir := newVault(t)
+	v.Put(RootID, "kept.txt", strings.NewReader("kept"))
+	for i := 0; i < 10; i++ {
+		v.PutDeferred(RootID, fmt.Sprintf("lost%d", i), strings.NewReader("lost"))
+	}
+	v.PutDeferred(RootID, "big.bin", bytes.NewReader(randomBytes(t, packFileMax+10)))
+	// A pulled card: what a fresh unlock sees.
+	crashed, err := Open(dir, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer crashed.Close()
+	if list, _ := crashed.List(RootID); len(list) != 1 {
+		t.Fatalf("after crash: %d entries, want 1", len(list))
+	}
+	if b, p := countFiles(t, filepath.Join(dir, blobsDir)), countFiles(t, filepath.Join(dir, packsDir)); b != 1 || p != 0 {
+		t.Fatalf("after crash: %d blobs and %d packs, want 1 and 0", b, p)
+	}
+}
+
+func TestGarbageCollectionKeepsAppleDouble(t *testing.T) {
+	v, dir := newVault(t)
+	e, _ := v.Put(RootID, "a.txt", strings.NewReader("a"))
+	v.PutDeferred(RootID, "b.txt", strings.NewReader("b"))
+	v.Flush()
+	sidecars := []string{
+		filepath.Join(filepath.Dir(filepath.Join(dir, e.Blob)), "._"+filepath.Base(e.Blob)),
+		filepath.Join(dir, packsDir, "._0123.age"),
+	}
+	for _, p := range sidecars {
+		os.WriteFile(p, []byte("attrs"), 0o600)
+	}
+	orphan := filepath.Join(dir, packsDir, "0123.age")
+	os.WriteFile(orphan, []byte("orphan"), 0o600)
+	v = reopen(t, v, dir)
+	defer v.Close()
+	for _, p := range sidecars {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("AppleDouble file removed: %s", p)
+		}
+	}
+	if _, err := os.Stat(orphan); err == nil {
+		t.Error("orphan pack kept")
+	}
+}
+
+func TestVerifyPackFindsDamagedMembers(t *testing.T) {
+	v, dir := newVault(t)
+	const n, size = 40, 10_000
+	var ids []string
+	for i := 0; i < n; i++ {
+		e, err := v.PutDeferred(RootID, fmt.Sprintf("f%02d", i), bytes.NewReader(randomBytes(t, size)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, e.ID)
+	}
+	v.Flush()
+	packs, _ := filepath.Glob(filepath.Join(dir, packsDir, "*.age"))
+	if len(packs) != 1 {
+		t.Fatalf("%d packs", len(packs))
+	}
+	// Ciphertext: header, 16-byte nonce, then 64 KiB chunks with 16-byte tags.
+	data, _ := os.ReadFile(packs[0])
+	const chunk = 64 << 10
+	plain := n * size
+	chunks := (plain + chunk - 1) / chunk
+	header := len(data) - plain - 16 - chunks*16
+	const bad = 3
+	data[header+16+bad*(chunk+16)+100] ^= 1
+	os.WriteFile(packs[0], data, 0o600)
+
+	problems, done, err := v.Verify(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Files != n || done.Bytes != n*size {
+		t.Fatalf("progress %+v", done)
+	}
+	got := map[string]bool{}
+	for _, p := range problems {
+		got[p.ID] = true
+	}
+	for i, id := range ids {
+		start, end := i*size, (i+1)*size
+		hit := start < (bad+1)*chunk && end > bad*chunk
+		if got[id] != hit {
+			t.Errorf("f%02d [%d, %d): reported %v, want %v", i, start, end, got[id], hit)
+		}
 	}
 }
 
@@ -545,6 +754,12 @@ func TestStandardAgeCLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v.PutDeferred(RootID, "before.txt", strings.NewReader("first member"))
+	small := randomBytes(t, 3000)
+	packed, err := v.PutDeferred(RootID, "small.bin", bytes.NewReader(small))
+	if err != nil {
+		t.Fatal(err)
+	}
 	v.Close()
 
 	run := func(args ...string) []byte {
@@ -571,5 +786,14 @@ func TestStandardAgeCLI(t *testing.T) {
 	got := run("-d", "-i", keyPath, filepath.Join(dir, filepath.FromSlash(e.Blob)))
 	if !bytes.Equal(got, content) {
 		t.Fatal("age CLI decrypted different content")
+	}
+	// A packed file is the slice [offset, offset+size) of the decrypted
+	// pack, as the card README tells to cut it.
+	if packed.Pack == "" || packed.Offset == 0 {
+		t.Fatalf("small file not packed after another member: %+v", packed)
+	}
+	pack := run("-d", "-i", keyPath, filepath.Join(dir, filepath.FromSlash(packed.Pack)))
+	if got := pack[packed.Offset : packed.Offset+packed.Size]; !bytes.Equal(got, small) {
+		t.Fatal("slice of the CLI-decrypted pack differs")
 	}
 }
