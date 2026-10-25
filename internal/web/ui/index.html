@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сейф</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><span class="lock" aria-hidden="true">🔒</span> Сейф</div>
+  <div class="actions">
+    <button id="btn-upload" type="button">Загрузить файлы</button>
+    <button id="btn-upload-dir" type="button">Загрузить папку</button>
+    <button id="btn-mkdir" type="button">Новая папка</button>
+    <button id="btn-close" type="button" class="danger">Закрыть сейф</button>
+  </div>
+  <input id="pick-files" type="file" multiple hidden>
+  <input id="pick-dir" type="file" webkitdirectory multiple hidden>
+</header>
+
+<div class="layout">
+  <nav class="tree" id="tree" aria-label="Папки"></nav>
+  <main id="main">
+    <ol class="crumbs" id="crumbs" aria-label="Путь"></ol>
+    <table class="list">
+      <thead><tr><th>Имя</th><th class="num">Размер</th><th>Изменён</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="empty" id="empty" hidden>Папка пуста. Перетащите сюда файлы или папки.</p>
+  </main>
+</div>
+
+<div class="uploads" id="uploads" hidden>
+  <div class="uploads-text" id="uploads-text"></div>
+  <div class="progress"><div id="uploads-bar"></div></div>
+</div>
+
+<div class="toast" id="toast" role="alert" hidden></div>
+<div class="drop" id="drop" hidden><div>Отпустите, чтобы зашифровать и загрузить</div></div>
+
+<div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-labelledby="viewer-name">
+  <div class="viewer-bar">
+    <button id="viewer-prev" type="button" title="Предыдущий (←)">←</button>
+    <button id="viewer-next" type="button" title="Следующий (→)">→</button>
+    <span class="viewer-name" id="viewer-name"></span>
+    <a id="viewer-dl" class="button" href="#">Скачать</a>
+    <button id="viewer-close" type="button" title="Закрыть (Esc)">✕</button>
+  </div>
+  <div class="viewer-body" id="viewer-body"></div>
+</div>
+
+<div class="closed" id="closed" hidden>
+  <div>
+    <div class="closed-icon" aria-hidden="true">🔒</div>
+    <h1>Сейф закрыт</h1>
+    <p>Все изменения записаны. Вкладку можно закрыть, а карту — вынуть.</p>
+  </div>
+</div>
+</body>
+</html>
