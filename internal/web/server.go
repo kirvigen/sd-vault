@@ -17,6 +17,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"sd-vault/internal/vault"
 )
@@ -33,7 +34,21 @@ type Server struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// Uploads with batch=1 leave the index in memory. It is written on
+	// /api/flush, which the UI sends when its queue empties, after flushIdle
+	// without uploads (a closed tab), and at least every flushEvery while
+	// uploads keep coming, which bounds what a pulled card can lose.
+	batchMu      sync.Mutex
+	flushTimer   *time.Timer
+	pendingSince time.Time
 }
+
+// Variables so tests can shorten them.
+var (
+	flushIdle  = 3 * time.Second
+	flushEvery = 30 * time.Second
+)
 
 // New returns a server for v. host is the address the browser will use; any
 // other Host header is refused, which blocks DNS-rebinding attacks.
@@ -60,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/list", s.auth(http.HandlerFunc(s.handleList)))
 	mux.Handle("GET /api/file/{id}", s.auth(http.HandlerFunc(s.handleFile)))
 	mux.Handle("POST /api/upload", s.auth(http.HandlerFunc(s.handleUpload)))
+	mux.Handle("POST /api/flush", s.auth(http.HandlerFunc(s.handleFlush)))
 	mux.Handle("POST /api/mkdir", s.auth(http.HandlerFunc(s.handleMkdir)))
 	mux.Handle("POST /api/rename", s.auth(http.HandlerFunc(s.handleRename)))
 	mux.Handle("POST /api/delete", s.auth(http.HandlerFunc(s.handleDelete)))
@@ -192,10 +208,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, vault.ErrBadName)
 		return
 	}
+	batch := q.Get("batch") != ""
+	mkdirAll, put := s.v.MkdirAll, s.v.Put
+	if batch {
+		mkdirAll, put = s.v.MkdirAllDeferred, s.v.PutDeferred
+	}
 	folder, name := path.Split(rel)
 	if folder != "" {
 		var err error
-		if dir, err = s.v.MkdirAll(dir, folder); err != nil {
+		if dir, err = mkdirAll(dir, folder); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -203,12 +224,57 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// The body is read as a stream straight into the encryptor. No multipart
 	// parsing: Go's multipart form code spills big uploads to a temp file in
 	// plain text.
-	e, err := s.v.Put(dir, name, r.Body)
+	e, err := put(dir, name, r.Body)
+	if batch {
+		// Folders made above are pending even when the put failed.
+		s.scheduleFlush()
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeJSON(w, e)
+}
+
+func (s *Server) scheduleFlush() {
+	s.batchMu.Lock()
+	if s.pendingSince.IsZero() {
+		s.pendingSince = time.Now()
+	}
+	due := time.Since(s.pendingSince) >= flushEvery
+	if s.flushTimer == nil {
+		s.flushTimer = time.AfterFunc(flushIdle, func() { s.flush() })
+	} else {
+		s.flushTimer.Reset(flushIdle)
+	}
+	s.batchMu.Unlock()
+	if due {
+		if err := s.flush(); err != nil {
+			log.Printf("индекс не записан: %v", err)
+		}
+	}
+}
+
+func (s *Server) flush() error {
+	s.batchMu.Lock()
+	if s.flushTimer != nil {
+		s.flushTimer.Stop()
+	}
+	s.pendingSince = time.Time{}
+	s.batchMu.Unlock()
+	err := s.v.Flush()
+	if errors.Is(err, vault.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) handleFlush(w http.ResponseWriter, r *http.Request) {
+	if err := s.flush(); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 type nameRequest struct {

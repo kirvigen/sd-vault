@@ -234,7 +234,8 @@ function enqueue(items) {
 function sendOne(item, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/upload?dir=${encodeURIComponent(item.dir)}&path=${encodeURIComponent(item.path)}`);
+    // batch=1: the server writes the index once, on the flush after the queue.
+    xhr.open('POST', `/api/upload?batch=1&dir=${encodeURIComponent(item.dir)}&path=${encodeURIComponent(item.path)}`);
     xhr.upload.onprogress = (ev) => ev.lengthComputable && onProgress(ev.loaded);
     xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(xhr.responseText.trim() || xhr.statusText)));
     xhr.onerror = () => reject(new Error('связь с программой потеряна'));
@@ -269,6 +270,10 @@ async function runQueue() {
       if (state.closed) break;
     }
     if (item.dir === state.dir) refresh();
+  }
+  if (!state.closed) {
+    $('#uploads-text').textContent = 'Сохраняю список файлов…';
+    try { await post('/api/flush', {}); } catch (e) { toast(`Список файлов не сохранён: ${e.message}`); }
   }
   uploading = false;
   if (scanning) showScan(0);

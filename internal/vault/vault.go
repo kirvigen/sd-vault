@@ -80,6 +80,11 @@ type Vault struct {
 	mu       sync.RWMutex
 	identity *age.X25519Identity
 	idx      *index
+	// dirty means idx has deferred changes that are not on disk yet.
+	dirty bool
+	// doomed are blobs that deferred puts replaced. They are removed only
+	// once an index that no longer names them is on disk.
+	doomed []string
 }
 
 // Exists reports whether dir already holds a vault.
@@ -199,7 +204,7 @@ func (v *Vault) loadIndex(name string) (*index, error) {
 
 // saveIndex must be called with mu held for writing (or before v is shared).
 func (v *Vault) saveIndex() error {
-	data, err := json.MarshalIndent(v.idx, "", "  ")
+	data, err := json.Marshal(v.idx)
 	if err != nil {
 		return err
 	}
@@ -213,6 +218,37 @@ func (v *Vault) saveIndex() error {
 		}
 		return ew.Close()
 	})
+}
+
+// commit makes the index change durable, or, when deferred, only marks it
+// for the next Flush. mu must be held for writing.
+func (v *Vault) commit(deferred bool) error {
+	if deferred {
+		v.dirty = true
+		return nil
+	}
+	if err := v.saveIndex(); err != nil {
+		return err
+	}
+	v.dirty = false
+	for _, b := range v.doomed {
+		os.Remove(filepath.Join(v.dir, filepath.FromSlash(b)))
+	}
+	v.doomed = nil
+	return nil
+}
+
+// Flush writes the index if deferred changes are pending.
+func (v *Vault) Flush() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if err := v.check(); err != nil {
+		return err
+	}
+	if !v.dirty {
+		return nil
+	}
+	return v.commit(false)
 }
 
 // collectGarbage removes what an interrupted operation left behind:
@@ -245,10 +281,13 @@ func (v *Vault) collectGarbage() {
 	})
 }
 
-// Close forgets the key and the index. Every change is already on disk:
-// each mutating call saves the index before returning.
+// Close writes pending deferred changes and forgets the key and the index.
+// A failed write is not reported here: call Flush first to see it.
 func (v *Vault) Close() {
 	v.mu.Lock()
+	if v.idx != nil && v.dirty {
+		v.commit(false)
+	}
 	v.identity = nil
 	v.idx = nil
 	v.mu.Unlock()
@@ -374,6 +413,10 @@ func (v *Vault) newID() string {
 
 // Mkdir creates a folder, or returns the existing folder with that name.
 func (v *Vault) Mkdir(parentID, name string) (Entry, error) {
+	return v.mkdir(parentID, name, false)
+}
+
+func (v *Vault) mkdir(parentID, name string, deferred bool) (Entry, error) {
 	if err := validName(name); err != nil {
 		return Entry{}, err
 	}
@@ -393,7 +436,7 @@ func (v *Vault) Mkdir(parentID, name string) (Entry, error) {
 	}
 	e := &Entry{ID: v.newID(), Parent: parentID, Name: name, Dir: true, Modified: time.Now().UTC()}
 	v.idx.Entries[e.ID] = e
-	if err := v.saveIndex(); err != nil {
+	if err := v.commit(deferred); err != nil {
 		delete(v.idx.Entries, e.ID)
 		return Entry{}, err
 	}
@@ -403,11 +446,20 @@ func (v *Vault) Mkdir(parentID, name string) (Entry, error) {
 // MkdirAll creates every folder of a slash-separated relative path under
 // parentID and returns the ID of the deepest one.
 func (v *Vault) MkdirAll(parentID, rel string) (string, error) {
+	return v.mkdirAll(parentID, rel, false)
+}
+
+// MkdirAllDeferred is MkdirAll that leaves the index for Flush.
+func (v *Vault) MkdirAllDeferred(parentID, rel string) (string, error) {
+	return v.mkdirAll(parentID, rel, true)
+}
+
+func (v *Vault) mkdirAll(parentID, rel string, deferred bool) (string, error) {
 	for _, name := range strings.Split(rel, "/") {
 		if name == "" {
 			continue
 		}
-		e, err := v.Mkdir(parentID, name)
+		e, err := v.mkdir(parentID, name, deferred)
 		if err != nil {
 			return "", err
 		}
@@ -420,6 +472,19 @@ func (v *Vault) MkdirAll(parentID, rel string) (string, error) {
 // file with that name is replaced. The content is encrypted on the fly and
 // never touches the disk in plain text.
 func (v *Vault) Put(parentID, name string, r io.Reader) (Entry, error) {
+	return v.put(parentID, name, r, false)
+}
+
+// PutDeferred is Put that changes the index only in memory: the file is
+// listed and readable at once, but survives a pulled card only after Flush
+// (or any other mutation, which saves the whole index). Uploading a folder
+// this way writes the index once instead of once per file, and on a slow
+// card each write is a full copy of the index plus several fsyncs.
+func (v *Vault) PutDeferred(parentID, name string, r io.Reader) (Entry, error) {
+	return v.put(parentID, name, r, true)
+}
+
+func (v *Vault) put(parentID, name string, r io.Reader, deferred bool) (Entry, error) {
 	if err := validName(name); err != nil {
 		return Entry{}, err
 	}
@@ -482,16 +547,18 @@ func (v *Vault) Put(parentID, name string, r io.Reader) (Entry, error) {
 		e.ID = old.ID
 		prev := *old
 		*old = *e
-		if err := v.saveIndex(); err != nil {
+		// The old blob goes only after the index stops naming it.
+		v.doomed = append(v.doomed, prev.Blob)
+		if err := v.commit(deferred); err != nil {
+			v.doomed = v.doomed[:len(v.doomed)-1]
 			*old = prev
 			return fail(err)
 		}
-		os.Remove(filepath.Join(v.dir, filepath.FromSlash(prev.Blob)))
 		return *old, nil
 	}
 	e.ID = v.newID()
 	v.idx.Entries[e.ID] = e
-	if err := v.saveIndex(); err != nil {
+	if err := v.commit(deferred); err != nil {
 		delete(v.idx.Entries, e.ID)
 		return fail(err)
 	}
@@ -520,7 +587,7 @@ func (v *Vault) Rename(id, name string) (Entry, error) {
 	}
 	prev := e.Name
 	e.Name = name
-	if err := v.saveIndex(); err != nil {
+	if err := v.commit(false); err != nil {
 		e.Name = prev
 		return Entry{}, err
 	}
@@ -554,7 +621,7 @@ func (v *Vault) Delete(id string) error {
 	for did := range doomed {
 		delete(v.idx.Entries, did)
 	}
-	if err := v.saveIndex(); err != nil {
+	if err := v.commit(false); err != nil {
 		for did, e := range doomed {
 			v.idx.Entries[did] = e
 		}

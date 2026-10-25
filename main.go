@@ -112,6 +112,10 @@ func run() error {
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		httpSrv.Close()
 	}
+	if err := v.Flush(); err != nil {
+		v.Close()
+		return fmt.Errorf("последние загрузки не записаны в индекс: %w", err)
+	}
 	v.Close()
 	fmt.Println("Сейф закрыт, все изменения записаны. Карту можно вынимать.")
 	return nil

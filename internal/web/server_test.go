@@ -1,12 +1,14 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +21,7 @@ const token = "test-token"
 
 type env struct {
 	t      *testing.T
+	dir    string // vault folder
 	srv    *Server
 	ts     *httptest.Server
 	client *http.Client // carries the session cookie
@@ -26,7 +29,8 @@ type env struct {
 
 func setup(t *testing.T) *env {
 	t.Helper()
-	v, err := vault.Create(filepath.Join(t.TempDir(), "vault"), "password123")
+	dir := filepath.Join(t.TempDir(), "vault")
+	v, err := vault.Create(dir, "password123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +51,7 @@ func setup(t *testing.T) *env {
 	if resp.StatusCode != 200 {
 		t.Fatalf("login: %d", resp.StatusCode)
 	}
-	return &env{t: t, srv: srv, ts: ts, client: client}
+	return &env{t: t, dir: dir, srv: srv, ts: ts, client: client}
 }
 
 func (e *env) do(method, path string, body io.Reader, hdr ...string) *http.Response {
@@ -200,6 +204,69 @@ func TestMkdirRenameDelete(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("deleted file: %d", resp.StatusCode)
+	}
+}
+
+// onDisk lists the root folder as a fresh unlock would see it now, that is,
+// after a pulled card.
+func (e *env) onDisk() []string {
+	e.t.Helper()
+	v, err := vault.Open(e.dir, "password123")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer v.Close()
+	list, err := v.List(vault.RootID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var names []string
+	for _, x := range list {
+		names = append(names, x.Name)
+	}
+	return names
+}
+
+func TestBatchUploadWritesIndexOnFlush(t *testing.T) {
+	e := setup(t)
+	index := filepath.Join(e.dir, "index.age")
+	before, _ := os.ReadFile(index)
+	for _, p := range []string{"a.txt", "Фото/b.txt", "Фото/2024/c.txt"} {
+		resp := e.do("POST", "/api/upload?batch=1&path="+url.QueryEscape(p), strings.NewReader(p))
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("upload %s: %d", p, resp.StatusCode)
+		}
+	}
+	if n := len(e.list("").Entries); n != 2 {
+		t.Fatalf("listed %d root entries during the batch, want 2", n)
+	}
+	if after, _ := os.ReadFile(index); !bytes.Equal(before, after) {
+		t.Fatal("index written during the batch")
+	}
+
+	resp := e.do("POST", "/api/flush", strings.NewReader("{}"))
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("flush: %d", resp.StatusCode)
+	}
+	if got := e.onDisk(); len(got) != 2 {
+		t.Fatalf("on disk after flush: %v", got)
+	}
+}
+
+func TestBatchFlushesWhenIdle(t *testing.T) {
+	old := flushIdle
+	flushIdle = 50 * time.Millisecond
+	t.Cleanup(func() { flushIdle = old })
+	e := setup(t)
+	resp := e.do("POST", "/api/upload?batch=1&path=a.txt", strings.NewReader("a"))
+	resp.Body.Close()
+	for deadline := time.Now().Add(5 * time.Second); len(e.onDisk()) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("index not written after the idle delay")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

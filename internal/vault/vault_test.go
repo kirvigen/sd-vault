@@ -313,6 +313,74 @@ func TestInterruptedUploadLeavesNothing(t *testing.T) {
 	}
 }
 
+func TestDeferredPut(t *testing.T) {
+	v, dir := newVault(t)
+	blobs := filepath.Join(dir, blobsDir)
+	old, err := v.Put(RootID, "a.txt", strings.NewReader("old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := v.MkdirAllDeferred(RootID, "Фото/2024")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutDeferred(folder, "b.txt", strings.NewReader("b")); err != nil {
+		t.Fatal(err)
+	}
+	a, err := v.PutDeferred(RootID, "a.txt", strings.NewReader("new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, v, a.ID); string(got) != "new" {
+		t.Fatalf("deferred content: %q", got)
+	}
+	// The replaced blob must outlive the on-disk index that still names it.
+	if _, err := os.Stat(filepath.Join(dir, old.Blob)); err != nil {
+		t.Fatalf("replaced blob removed before flush: %v", err)
+	}
+
+	// A pulled card: a fresh unlock sees the state before the batch.
+	crashed, err := Open(dir, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, crashed, findByName(t, crashed, RootID, "a.txt").ID); string(got) != "old" {
+		t.Fatalf("after crash: %q, want the old content", got)
+	}
+	if list, _ := crashed.List(RootID); len(list) != 1 {
+		t.Fatalf("after crash: %d root entries, want 1", len(list))
+	}
+	if n := countFiles(t, blobs); n != 1 {
+		t.Fatalf("after crash: %d blobs, want 1 (unflushed ones are garbage)", n)
+	}
+	crashed.Close()
+}
+
+func TestFlushAndCloseWriteDeferred(t *testing.T) {
+	v, dir := newVault(t)
+	old, _ := v.Put(RootID, "a.txt", strings.NewReader("old"))
+	if _, err := v.PutDeferred(RootID, "a.txt", strings.NewReader("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, old.Blob)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("replaced blob kept after flush: %v", err)
+	}
+	if _, err := v.PutDeferred(RootID, "b.txt", strings.NewReader("b")); err != nil {
+		t.Fatal(err)
+	}
+	v = reopen(t, v, dir) // Close writes what is pending
+	if got := readAll(t, v, findByName(t, v, RootID, "a.txt").ID); string(got) != "new" {
+		t.Fatalf("a.txt: %q", got)
+	}
+	findByName(t, v, RootID, "b.txt")
+	if n := countFiles(t, filepath.Join(dir, blobsDir)); n != 2 {
+		t.Fatalf("%d blobs, want 2", n)
+	}
+}
+
 func TestNoPlaintextOnDisk(t *testing.T) {
 	v, dir := newVault(t)
 	secret := "SECRET-CONTENT-7f3a9c"
@@ -446,7 +514,7 @@ func TestStandardAgeCLI(t *testing.T) {
 	os.WriteFile(keyPath, key, 0o600)
 
 	index := run("-d", "-i", keyPath, filepath.Join(dir, indexFile))
-	if !bytes.Contains(index, []byte(`"name": "file.bin"`)) || !bytes.Contains(index, []byte(e.Blob)) {
+	if !bytes.Contains(index, []byte(`"name":"file.bin"`)) || !bytes.Contains(index, []byte(e.Blob)) {
 		t.Fatalf("index does not list the file:\n%s", index)
 	}
 	got := run("-d", "-i", keyPath, filepath.Join(dir, filepath.FromSlash(e.Blob)))
