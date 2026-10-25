@@ -50,6 +50,10 @@ const post = (url, body) =>
   api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 const fileURL = (e, dl) => `/api/file/${encodeURIComponent(e.id)}${dl ? '?dl=1' : ''}`;
+const zipURL = (e) => `/api/zip?dir=${encodeURIComponent(e.id)}`;
+// Browsers other than Safari cannot show HEIC, the iPhone photo format, so
+// the viewer asks the server for a JPEG made from it.
+const isHEIC = (e) => /\.hei[cf]$/i.test(e.name);
 
 // ---------- UI helpers ----------
 
@@ -123,7 +127,9 @@ function renderRows() {
     link.onclick = (ev) => { ev.preventDefault(); e.dir ? go(e.id) : openViewer(e); };
 
     const ops = el('td', { className: 'ops' });
-    if (!e.dir) ops.append(el('a', { className: 'button', href: fileURL(e, true), textContent: 'Скачать' }), ' ');
+    const dl = el('a', { className: 'button', href: e.dir ? zipURL(e) : fileURL(e, true), textContent: 'Скачать' });
+    if (e.dir) dl.title = 'Скачать папку целиком одним zip-архивом';
+    ops.append(dl, ' ');
     const ren = el('button', { type: 'button', textContent: 'Переименовать' });
     ren.onclick = () => rename(e);
     const del = el('button', { type: 'button', className: 'danger', textContent: 'Удалить' });
@@ -465,8 +471,16 @@ async function openViewer(e) {
     el('p', { textContent: '«Скачать» сохранит расшифрованную копию на этот компьютер — после работы её стоит удалить.' })));
 
   if (k === 'image') {
-    const img = el('img', { src: url, alt: e.name });
-    img.onerror = () => cantShow('Браузер не умеет показывать этот формат изображений.');
+    const heic = isHEIC(e);
+    const img = el('img', { src: heic ? url + '?view=jpeg' : url, alt: e.name });
+    img.onerror = () => cantShow(heic ? 'Не удалось показать это фото HEIC.' : 'Браузер не умеет показывать этот формат изображений.');
+    if (heic) {
+      // Converting a 12 MP photo takes about a second on the server.
+      const wait = el('div', { className: 'note', textContent: 'Готовлю фото…' });
+      img.hidden = true;
+      img.onload = () => { wait.remove(); img.hidden = false; };
+      body.append(wait);
+    }
     body.append(img);
   } else if (k === 'pdf') {
     body.append(el('iframe', { src: url, title: e.name }));

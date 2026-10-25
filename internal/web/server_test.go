@@ -1,9 +1,12 @@
 package web
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"image/jpeg"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -360,4 +363,205 @@ func TestUploadRefusedWhenCardFull(t *testing.T) {
 		t.Errorf("refused upload listed: %d entries", n)
 	}
 	e.upload("", "small.txt", "fits")
+}
+
+func TestHEICIsShownAsJPEG(t *testing.T) {
+	e := setup(t)
+	data, err := os.ReadFile("testdata/red-blue.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent := e.upload("", "IMG_0001.HEIC", string(data))
+
+	resp := e.do("GET", "/api/file/"+ent.ID+"?view=jpeg", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "image/jpeg" {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("view: %d %s %s", resp.StatusCode, resp.Header.Get("Content-Type"), b)
+	}
+	img, err := jpeg.Decode(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := img.Bounds(); b.Dx() != 64 || b.Dy() != 32 {
+		t.Fatalf("size %v, want 64×32", b)
+	}
+	if r, _, bl, _ := img.At(8, 16).RGBA(); r < 0xc000 || bl > 0x4000 {
+		t.Errorf("left half is not red: r=%x b=%x", r, bl)
+	}
+	if r, _, bl, _ := img.At(56, 16).RGBA(); bl < 0xc000 || r > 0x4000 {
+		t.Errorf("right half is not blue: r=%x b=%x", r, bl)
+	}
+
+	// Downloads stay the original.
+	orig := e.do("GET", "/api/file/"+ent.ID+"?dl=1", nil)
+	got, _ := io.ReadAll(orig.Body)
+	orig.Body.Close()
+	if !bytes.Equal(got, data) {
+		t.Error("download is not the original HEIC")
+	}
+
+	bad := e.upload("", "broken.heic", "not a photo")
+	resp = e.do("GET", "/api/file/"+bad.ID+"?view=jpeg", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("broken HEIC: %d", resp.StatusCode)
+	}
+}
+
+func TestFolderDownloadsAsZip(t *testing.T) {
+	e := setup(t)
+	files := map[string]string{
+		"Фото/a.txt":            "первый",
+		"Фото/2024/b.txt":       "второй",
+		"Фото/2024/май/c.bin":   strings.Repeat("x", 3<<20),
+		"Другое/not-inside.txt": "нет",
+	}
+	for p, c := range files {
+		e.upload("", p, c)
+	}
+	var photos vault.Entry
+	for _, x := range e.list("").Entries {
+		if x.Name == "Фото" {
+			photos = x
+		}
+	}
+	mk := e.do("POST", "/api/mkdir", strings.NewReader(`{"dir":"`+photos.ID+`","name":"Пустая"}`))
+	mk.Body.Close()
+
+	read := func(dir string) (*zip.Reader, http.Header) {
+		t.Helper()
+		resp := e.do("GET", "/api/zip?dir="+url.QueryEscape(dir), nil)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("zip: %d %s", resp.StatusCode, body)
+		}
+		zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return zr, resp.Header
+	}
+
+	zr, hdr := read(photos.ID)
+	if cd := hdr.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment") || !strings.Contains(cd, "%D0%A4%D0%BE%D1%82%D0%BE.zip") {
+		t.Errorf("Content-Disposition: %s", cd)
+	}
+	got := map[string]string{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", f.Name, err)
+		}
+		got[f.Name] = string(b)
+	}
+	want := map[string]string{
+		"Фото/": "", "Фото/2024/": "", "Фото/2024/май/": "", "Фото/Пустая/": "",
+		"Фото/a.txt": files["Фото/a.txt"], "Фото/2024/b.txt": files["Фото/2024/b.txt"],
+		"Фото/2024/май/c.bin": files["Фото/2024/май/c.bin"],
+	}
+	if len(got) != len(want) {
+		t.Errorf("archive has %d entries, want %d: %v", len(got), len(want), keys(got))
+	}
+	for name, c := range want {
+		if g, ok := got[name]; !ok || g != c {
+			t.Errorf("%s: present %v, %d bytes, want %d", name, ok, len(g), len(c))
+		}
+	}
+
+	whole, hdr := read("")
+	if !strings.Contains(hdr.Get("Content-Disposition"), "%D0%A1%D0%B5%D0%B9%D1%84.zip") {
+		t.Errorf("root archive name: %s", hdr.Get("Content-Disposition"))
+	}
+	if len(whole.File) != len(want)+3 {
+		t.Errorf("root archive: %d entries", len(whole.File))
+	}
+
+	var file vault.Entry
+	for _, x := range e.list(photos.ID).Entries {
+		if x.Name == "a.txt" {
+			file = x
+		}
+	}
+	resp := e.do("GET", "/api/zip?dir="+file.ID, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("zip of a file: %d", resp.StatusCode)
+	}
+}
+
+func TestZipListsDamagedFiles(t *testing.T) {
+	e := setup(t)
+	e.upload("", "Папка/ok.txt", "цел")
+	e.upload("", "Папка/bad.bin", strings.Repeat("y", 2<<20))
+	// Damage the blob of bad.bin on the card.
+	var blob string
+	filepath.WalkDir(filepath.Join(e.dir, "blobs"), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".age") {
+			if st, _ := os.Stat(p); st.Size() > 1<<20 {
+				blob = p
+			}
+		}
+		return nil
+	})
+	f, err := os.OpenFile(blob, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteAt([]byte("испорчено"), 1<<20)
+	f.Close()
+
+	resp := e.do("GET", "/api/zip?dir="+e.list("").Entries[0].ID, nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report string
+	for _, zf := range zr.File {
+		if zf.Name == "Папка/"+problemsFile {
+			rc, _ := zf.Open()
+			b, _ := io.ReadAll(rc)
+			rc.Close()
+			report = string(b)
+		}
+	}
+	if !strings.Contains(report, "Папка/bad.bin") || strings.Contains(report, "ok.txt") {
+		t.Errorf("problems file: %q", report)
+	}
+}
+
+func keys(m map[string]string) []string {
+	var k []string
+	for x := range m {
+		k = append(k, x)
+	}
+	return k
+}
+
+func TestZipTimesAreLocal(t *testing.T) {
+	e := setup(t)
+	e.upload("", "П/a.txt", "a")
+	resp := e.do("GET", "/api/zip?dir="+e.list("").Entries[0].ID, nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range zr.File {
+		// The DOS fields alone, as Finder and Explorer read them.
+		dos := time.Date(1980+int(f.ModifiedDate>>9), time.Month(f.ModifiedDate>>5&0xf), int(f.ModifiedDate&0x1f),
+			int(f.ModifiedTime>>11), int(f.ModifiedTime>>5&0x3f), int(f.ModifiedTime&0x1f)*2, 0, time.Local)
+		if d := time.Since(dos); d < -time.Minute || d > time.Minute {
+			t.Errorf("%s: zip time %v, uploaded just now", f.Name, dos)
+		}
+	}
 }

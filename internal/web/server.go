@@ -6,6 +6,7 @@
 package web
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
@@ -89,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /static/", s.auth(http.StripPrefix("/static/", static)))
 	mux.Handle("GET /api/list", s.auth(http.HandlerFunc(s.handleList)))
 	mux.Handle("GET /api/file/{id}", s.auth(http.HandlerFunc(s.handleFile)))
+	mux.Handle("GET /api/zip", s.auth(http.HandlerFunc(s.handleZip)))
 	mux.Handle("POST /api/upload", s.auth(http.HandlerFunc(s.handleUpload)))
 	mux.Handle("POST /api/space", s.auth(http.HandlerFunc(s.handleSpace)))
 	mux.Handle("POST /api/flush", s.auth(http.HandlerFunc(s.handleFlush)))
@@ -201,11 +203,16 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	q := r.URL.Query()
+	if q.Get("view") == "jpeg" && isHEIC(e.Name) {
+		s.serveHEIC(w, r, f, e)
+		return
+	}
 	ctype := ContentType(e.Name)
 	h := w.Header()
 	h.Set("Content-Type", ctype)
 	disposition := "inline"
-	if r.URL.Query().Get("dl") != "" {
+	if q.Get("dl") != "" {
 		disposition = "attachment"
 	}
 	h.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": e.Name}))
@@ -216,6 +223,21 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		h.Set("Content-Security-Policy", "sandbox")
 	}
 	http.ServeContent(w, r, "", e.Modified, f)
+}
+
+// serveHEIC shows a HEIC photo as a JPEG made in memory.
+func (s *Server) serveHEIC(w http.ResponseWriter, r *http.Request, f io.Reader, e vault.Entry) {
+	data, err := heicToJPEG(f)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "image/jpeg")
+	h.Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{
+		"filename": strings.TrimSuffix(e.Name, path.Ext(e.Name)) + ".jpg"}))
+	h.Set("Content-Security-Policy", "sandbox")
+	http.ServeContent(w, r, "", e.Modified, bytes.NewReader(data))
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {

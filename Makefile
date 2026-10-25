@@ -6,7 +6,10 @@ GO      ?= go
 DIST    := dist
 BUILD   := build
 LDFLAGS := -s -w -X main.version=$(VERSION)
-GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)'
+# The HEIC decoder runs as Go code transpiled from WASM, never a system
+# libheif: the same on every computer, no C library to look for.
+TAGS    := nodynamic,wasm2go
+GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -tags $(TAGS) -ldflags '$(LDFLAGS)'
 
 SIGN_KEY ?= $(HOME)/.config/sd-vault/release.key
 
@@ -54,7 +57,7 @@ release:
 	gh release create $(VERSION) $(DIST)/* --title $(VERSION) --notes "$(NOTES)"
 
 test:
-	$(GO) test ./...
+	$(GO) test -tags $(TAGS) ./...
 
 clean:
 	rm -rf $(DIST) $(BUILD)
