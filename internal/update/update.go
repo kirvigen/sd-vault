@@ -54,6 +54,9 @@ type Updater struct {
 	Exe     string // path of the running program
 	Client  *http.Client
 	Log     io.Writer
+	// FreeSpace reports the bytes free in a directory; nil means the real
+	// disk. Tests replace it.
+	FreeSpace func(dir string) (int64, error)
 }
 
 // New returns an Updater for the official repository.
@@ -77,6 +80,7 @@ type Release struct {
 	Version string
 	Notes   string
 	assets  map[string]string // file name → download URL
+	sizes   map[string]int64  // file name → size, as GitHub reports it
 }
 
 // Check returns the latest release when it is newer than the running
@@ -108,6 +112,7 @@ func (u *Updater) Check(ctx context.Context) (*Release, error) {
 		Assets []struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
+			Size int64  `json:"size"`
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&gh); err != nil {
@@ -117,9 +122,10 @@ func (u *Updater) Check(ctx context.Context) (*Release, error) {
 	if !ok || !newer(latest, cur) {
 		return nil, nil
 	}
-	r := &Release{Version: gh.Tag, Notes: printable(gh.Body), assets: map[string]string{}}
+	r := &Release{Version: gh.Tag, Notes: printable(gh.Body), assets: map[string]string{}, sizes: map[string]int64{}}
 	for _, a := range gh.Assets {
 		r.assets[a.Name] = a.URL
+		r.sizes[a.Name] = a.Size
 	}
 	return r, nil
 }
@@ -159,6 +165,10 @@ func (u *Updater) Install(ctx context.Context, r *Release) error {
 		}
 	}
 
+	if err := u.checkSpace(dir, r, targets); err != nil {
+		return err
+	}
+
 	var ready []string
 	defer func() {
 		for _, p := range ready {
@@ -180,6 +190,48 @@ func (u *Updater) Install(ctx context.Context, r *Release) error {
 	ready = nil
 	syncDir(dir)
 	return nil
+}
+
+// Every new file is downloaded next to the old one before any is swapped
+// in, so for a moment the card holds both. perFileSlack covers a file's last
+// cluster (up to 128 KiB on exFAT) and the "._" file macOS adds on FAT.
+const perFileSlack = 256 << 10
+
+// checkSpace refuses to start an update that cannot fit: running out of
+// space on the last file wastes minutes of downloading to a slow card and
+// ends in an error from the OS. GitHub's sizes are not signed, but they
+// only decide whether to try; the hashes still decide what is installed.
+func (u *Updater) checkSpace(dir string, r *Release, targets map[string]string) error {
+	freeSpace := u.FreeSpace
+	if freeSpace == nil {
+		freeSpace = diskFree
+	}
+	free, err := freeSpace(dir)
+	if err != nil {
+		return nil // cannot tell; let the download try
+	}
+	need := int64(1 << 20)
+	for name := range targets {
+		need += r.sizes[name] + perFileSlack
+	}
+	if free >= need {
+		return nil
+	}
+	return fmt.Errorf("на карте не хватает места для обновления: нужно %s, свободно %s. %s",
+		megabytes(need), megabytes(free), freeHint(need-free))
+}
+
+func freeHint(missing int64) string {
+	how := "Освободите место"
+	if missing > 0 {
+		how = "Освободите ещё " + megabytes(missing)
+	}
+	return how + " и запустите программу снова. Если удаляли файлы с карты, очистите Корзину: " +
+		"пока удалённое лежит в ней, оно занимает место на карте"
+}
+
+func megabytes(n int64) string {
+	return fmt.Sprintf("%.1f МБ", float64(n)/(1<<20))
 }
 
 // Verify checks the signature of a manifest and returns its file hashes.
@@ -291,6 +343,9 @@ func (u *Updater) download(ctx context.Context, r *Release, name, want, dst stri
 	}()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAsset+1))
+	if isNoSpace(err) {
+		return errors.New("на карте кончилось место. " + freeHint(0))
+	}
 	if err != nil {
 		return err
 	}
@@ -301,6 +356,9 @@ func (u *Updater) download(ctx context.Context, r *Release, name, want, dst stri
 		return errors.New("скачанный файл не совпал с подписанным — обновление отклонено")
 	}
 	if err = f.Sync(); err != nil {
+		if isNoSpace(err) {
+			return errors.New("на карте кончилось место. " + freeHint(0))
+		}
 		return err
 	}
 	return f.Close()

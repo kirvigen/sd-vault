@@ -67,10 +67,11 @@ func (f *fakeRelease) serve(w http.ResponseWriter, r *http.Request) {
 		type asset struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
+			Size int    `json:"size"`
 		}
 		var list []asset
-		for n := range assets {
-			list = append(list, asset{n, f.srv.URL + "/dl/" + n})
+		for n, b := range assets {
+			list = append(list, asset{n, f.srv.URL + "/dl/" + n, len(b)})
 		}
 		json.NewEncoder(w).Encode(map[string]any{"tag_name": f.tag, "body": "fixes\x1b[2J", "assets": list})
 		return
@@ -276,4 +277,69 @@ func TestCheckOffersOnlyNewer(t *testing.T) {
 
 func TestPublicKeyIsValid(t *testing.T) {
 	New("v1.0.0", "x", io.Discard) // panics on a malformed key
+}
+
+func TestInstallRefusesWhenTheCardIsFull(t *testing.T) {
+	exe := card(t, self, "vault-windows.exe", "README.txt")
+	files := published()
+	files[self] = make([]byte, 3<<20)
+	f, key := newFake(t, "v1.1.0", files)
+	u := newUpdater(f, key, "v1.0.0", exe)
+	var askedDir string
+	u.FreeSpace = func(dir string) (int64, error) {
+		askedDir = dir
+		return 2 << 20, nil
+	}
+
+	r, err := u.Check(context.Background())
+	if err != nil || r == nil {
+		t.Fatalf("Check = %v, %v", r, err)
+	}
+	err = u.Install(context.Background(), r)
+	if err == nil {
+		t.Fatal("Install succeeded with 2 MB free for a 3 MB program")
+	}
+	for _, want := range []string{"не хватает места", "свободно 2.0 МБ", "Освободите ещё", "Корзину"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message %q lacks %q", err, want)
+		}
+	}
+	if askedDir != filepath.Dir(exe) {
+		t.Errorf("free space asked for %q, want the card folder", askedDir)
+	}
+	// Refused before any program was downloaded, and nothing changed.
+	for _, n := range f.fetched {
+		if n != manifestName && n != sigName {
+			t.Errorf("downloaded %s before refusing", n)
+		}
+	}
+	if got := read(t, exe); got != "old "+self {
+		t.Errorf("program changed: %q", got)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), "*"+newSuffix)); len(leftovers) > 0 {
+		t.Errorf("left %v", leftovers)
+	}
+
+	// With room for everything the same release installs.
+	u.FreeSpace = func(string) (int64, error) { return 100 << 20, nil }
+	if err := u.Install(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, exe); len(got) != 3<<20 {
+		t.Errorf("program not replaced: %d bytes", len(got))
+	}
+}
+
+func TestDiskFullIsRecognised(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x")
+	full := &os.PathError{Op: "write", Path: path, Err: noSpaceErrno}
+	if !isNoSpace(full) {
+		t.Error("write error for a full disk not recognised")
+	}
+	if isNoSpace(os.ErrNotExist) {
+		t.Error("unrelated error taken for a full disk")
+	}
+	if free, err := diskFree(t.TempDir()); err != nil || free <= 0 {
+		t.Errorf("diskFree = %d, %v", free, err)
+	}
 }

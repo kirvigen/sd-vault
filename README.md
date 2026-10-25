@@ -94,7 +94,11 @@ update.
 Trust does not come from GitHub. Each release carries `release.txt`
 (`sd-vault vX.Y.Z` plus sha256 lines) and `release.txt.sig`, an ed25519
 signature checked against `update.PublicKey`. The version line stops an old
-signed manifest from being replayed under a new tag. All files are
+signed manifest from being replayed under a new tag. Before downloading,
+the free space next to the program is checked against the sizes GitHub
+reports (all new files sit next to the old ones until the swap); a full card
+is refused at once with how much to free, instead of failing on the last
+file minutes later. All files are
 downloaded to `*.new` and verified before any rename; the running program is
 renamed to `*.old` (Windows allows that), and leftovers are removed on the
 next start.
