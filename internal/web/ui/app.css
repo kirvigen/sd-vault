@@ -125,6 +125,10 @@ main { flex: 1; overflow: auto; padding: 12px 20px 80px; min-width: 0; }
 .uploads-text { font-size: 13px; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .progress { height: 6px; background: var(--hover); border-radius: 3px; overflow: hidden; }
 .progress div { height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+/* Indeterminate: total size is not known yet. */
+.progress div.busy { width: 30% !important; transition: none; animation: busy 1.2s ease-in-out infinite; }
+@keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+@media (prefers-reduced-motion: reduce) { .progress div.busy { animation: none; width: 100% !important; opacity: 0.4; } }
 
 .toast {
   position: fixed; right: 16px; top: 64px; max-width: 380px;

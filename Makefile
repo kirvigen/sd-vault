@@ -8,7 +8,9 @@ BUILD   := build
 LDFLAGS := -s -w -X main.version=$(VERSION)
 GOBUILD := CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)'
 
-.PHONY: all dist windows macos linux readme test clean
+SIGN_KEY ?= $(HOME)/.config/sd-vault/release.key
+
+.PHONY: all dist windows macos linux readme test clean release
 
 all: dist
 
@@ -39,6 +41,17 @@ linux:
 readme:
 	@mkdir -p $(DIST)
 	cp README-card.txt $(DIST)/README.txt
+
+# make release VERSION=v1.2.3 NOTES="что нового": tags HEAD, signs dist/,
+# publishes the GitHub release that the programs offer as an update.
+release:
+	@case "$(VERSION)" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "VERSION=vX.Y.Z required"; exit 1;; esac
+	@test -z "$$(git status --porcelain)" || (echo "commit first"; exit 1)
+	$(MAKE) clean dist VERSION=$(VERSION)
+	$(GO) run ./tools/release sign -key $(SIGN_KEY) -version $(VERSION) $(DIST)
+	git tag -a $(VERSION) -m $(VERSION)
+	git push origin HEAD $(VERSION)
+	gh release create $(VERSION) $(DIST)/* --title $(VERSION) --notes "$(NOTES)"
 
 test:
 	$(GO) test ./...

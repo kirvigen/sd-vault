@@ -207,6 +207,22 @@ async function closeVault() {
 
 const queue = [];
 let uploading = false;
+let scanning = 0; // dropped folders still being read
+
+// While a dropped folder is read, nothing can be uploaded yet: the browser
+// hands out its files one by one. Show the count so it does not look stuck.
+// When an upload is already running, its own text stays.
+function showScan(found) {
+  if (uploading) return;
+  $('#uploads').hidden = false;
+  $('#uploads-text').textContent = `Читаю папку… найдено файлов: ${found}`;
+  $('#uploads-bar').classList.add('busy');
+}
+
+function hideScan() {
+  $('#uploads-bar').classList.remove('busy');
+  if (!uploading && !scanning) $('#uploads').hidden = true;
+}
 
 function enqueue(items) {
   // items: [{file, path}] where path is relative to the current folder.
@@ -228,6 +244,7 @@ function sendOne(item, onProgress) {
 
 async function runQueue() {
   uploading = true;
+  $('#uploads-bar').classList.remove('busy');
   const box = $('#uploads');
   box.hidden = false;
   let done = 0, failed = 0;
@@ -235,7 +252,8 @@ async function runQueue() {
     const item = queue.shift();
     const total = done + failed + queue.length + 1;
     const setText = (pct) =>
-      ($('#uploads-text').textContent = `Шифрую ${done + failed + 1} из ${total}: ${item.path}${pct != null ? ` — ${pct}%` : ''}`);
+      ($('#uploads-text').textContent = `Шифрую ${done + failed + 1} из ${total}${scanning ? '+' : ''}: ` +
+        `${item.path}${pct != null ? ` — ${pct}%` : ''}`);
     setText();
     $('#uploads-bar').style.width = '0';
     try {
@@ -253,7 +271,8 @@ async function runQueue() {
     if (item.dir === state.dir) refresh();
   }
   uploading = false;
-  box.hidden = true;
+  if (scanning) showScan(0);
+  else box.hidden = true;
   refresh();
   if (failed) toast(`Не загружено файлов: ${failed}`);
 }
@@ -270,16 +289,17 @@ $('#pick-dir').onchange = (ev) => {
 };
 
 // Drag and drop, folders included.
-async function collect(entry, prefix, out) {
+async function collect(entry, prefix, out, onFound) {
   if (entry.isFile) {
     const file = await new Promise((res, rej) => entry.file(res, rej));
     out.push({ file, path: prefix + file.name });
+    onFound(out.length);
   } else if (entry.isDirectory) {
     const reader = entry.createReader();
     let batch;
     do {
       batch = await new Promise((res, rej) => reader.readEntries(res, rej));
-      for (const child of batch) await collect(child, prefix + entry.name + '/', out);
+      for (const child of batch) await collect(child, prefix + entry.name + '/', out, onFound);
     } while (batch.length);
   }
 }
@@ -300,8 +320,22 @@ document.addEventListener('drop', async (ev) => {
   $('#drop').hidden = true;
   const entries = [...ev.dataTransfer.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
   const out = [];
-  if (entries.length) {
-    for (const en of entries) await collect(en, '', out);
+  if (entries.some((en) => en.isDirectory)) {
+    scanning++;
+    let frame = 0;
+    const onFound = (n) => frame || (frame = requestAnimationFrame(() => { frame = 0; showScan(n); }));
+    showScan(0);
+    try {
+      for (const en of entries) await collect(en, '', out, onFound);
+    } catch (e) {
+      toast(`Не удалось прочитать папку: ${e.message}`);
+    } finally {
+      cancelAnimationFrame(frame);
+      scanning--;
+      hideScan();
+    }
+  } else if (entries.length) {
+    for (const en of entries) await collect(en, '', out, () => {});
   } else {
     for (const f of ev.dataTransfer.files) out.push({ file: f, path: f.name });
   }

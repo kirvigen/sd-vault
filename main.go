@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/term"
 
+	"sd-vault/internal/update"
 	"sd-vault/internal/vault"
 	"sd-vault/internal/web"
 )
@@ -43,6 +44,7 @@ func run() error {
 	dirFlag := flag.String("dir", "", "папка сейфа (по умолчанию «vault» рядом с программой)")
 	noBrowser := flag.Bool("no-browser", false, "не открывать браузер, только напечатать ссылку")
 	port := flag.Int("port", 0, "порт на 127.0.0.1 (0 — случайный)")
+	noUpdate := flag.Bool("no-update", false, "не проверять обновления")
 	showVersion := flag.Bool("version", false, "показать версию")
 	flag.Parse()
 	if *showVersion {
@@ -50,15 +52,21 @@ func run() error {
 		return nil
 	}
 
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	update.Cleanup(exe)
+	// Only a person at the terminal can answer the question; scripts skip it.
+	if !*noUpdate && term.IsTerminal(int(os.Stdin.Fd())) {
+		offerUpdate(exe)
+	}
+
 	dir := *dirFlag
 	if dir == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-			exe = resolved
-		}
 		dir = filepath.Join(filepath.Dir(exe), "vault")
 	}
 
@@ -107,6 +115,54 @@ func run() error {
 	v.Close()
 	fmt.Println("Сейф закрыт, все изменения записаны. Карту можно вынимать.")
 	return nil
+}
+
+// offerUpdate asks before installing a newer release and restarts into it.
+// Being offline, or any failure, leaves the current version running: the
+// vault must open either way.
+func offerUpdate(exe string) {
+	u := update.New(version, exe, os.Stdout)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	r, err := u.Check(ctx)
+	cancel()
+	if err != nil || r == nil {
+		return
+	}
+	fmt.Printf("Вышла новая версия программы: %s (у вас %s).\n", r.Version, version)
+	if r.Notes != "" {
+		fmt.Println("\n  " + strings.ReplaceAll(r.Notes, "\n", "\n  ") + "\n")
+	}
+	fmt.Print("Обновить сейчас? [д/Н]: ")
+	switch strings.ToLower(readLine()) {
+	case "д", "да", "y", "yes", "l", "lf": // "l" is "д" on a Latin layout
+	default:
+		fmt.Print("Хорошо, работаю на текущей версии.\n\n")
+		return
+	}
+	fmt.Println("Обновляю. Подпись каждого файла проверяется до замены.")
+	if err := u.Install(context.Background(), r); err != nil {
+		fmt.Printf("Обновить не получилось: %v\nРаботаю на текущей версии.\n\n", err)
+		return
+	}
+	fmt.Printf("Готово, запускаю %s.\n\n", r.Version)
+	if err := update.Restart(exe); err != nil {
+		fmt.Printf("Не удалось перезапуститься (%v). Новая версия начнёт работать со следующего запуска.\n\n", err)
+	}
+}
+
+// readLine reads one line from the terminal without buffering ahead, so the
+// password prompt that follows still gets everything typed after it.
+func readLine() string {
+	var line []byte
+	b := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(b)
+		if n == 0 || err != nil || b[0] == '\n' {
+			break
+		}
+		line = append(line, b[0])
+	}
+	return strings.TrimSpace(string(line))
 }
 
 func unlock(dir string, in *passwordReader) (*vault.Vault, error) {
